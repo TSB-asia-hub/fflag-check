@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::data::flag_allowlist::is_allowed_flag;
-use crate::data::suspicious_flags::get_flag_severity;
+use crate::data::suspicious_flags::{get_flag_category, get_flag_description, get_flag_severity};
 use crate::models::{ScanFinding, ScanVerdict};
 
 /// Scan Roblox ClientAppSettings.json and bootstrapper configs for suspicious FFlags.
@@ -82,13 +82,19 @@ fn check_flat_json_flags(content: &str, path: &PathBuf, findings: &mut Vec<ScanF
         }
 
         let severity = get_flag_severity(key);
+        let category = get_flag_category(key).unwrap_or("UNKNOWN");
+        let desc = get_flag_description(key);
+        let detail_suffix = desc
+            .map(|d| format!(" | {}", d))
+            .unwrap_or_default();
+
         match severity {
             ScanVerdict::Flagged => {
                 findings.push(ScanFinding::new(
                     "client_settings_scanner",
                     ScanVerdict::Flagged,
                     format!("Critical FFlag detected: \"{}\" = {}", key, value),
-                    Some(format!("Path: {}", path.display())),
+                    Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
                 ));
             }
             ScanVerdict::Suspicious => {
@@ -96,7 +102,7 @@ fn check_flat_json_flags(content: &str, path: &PathBuf, findings: &mut Vec<ScanF
                     "client_settings_scanner",
                     ScanVerdict::Suspicious,
                     format!("Suspicious FFlag detected: \"{}\" = {}", key, value),
-                    Some(format!("Path: {}", path.display())),
+                    Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
                 ));
             }
             ScanVerdict::Clean => {
@@ -236,6 +242,12 @@ fn check_bootstrapper_flag_array(
         }
 
         let severity = get_flag_severity(flag_name);
+        let category = get_flag_category(flag_name).unwrap_or("UNKNOWN");
+        let desc = get_flag_description(flag_name);
+        let detail_suffix = desc
+            .map(|d| format!(" | {}", d))
+            .unwrap_or_default();
+
         match severity {
             ScanVerdict::Flagged => {
                 findings.push(ScanFinding::new(
@@ -245,7 +257,7 @@ fn check_bootstrapper_flag_array(
                         "{}: Critical FFlag \"{}\" = {}",
                         bootstrapper_name, flag_name, value
                     ),
-                    Some(format!("Path: {}", path.display())),
+                    Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
                 ));
             }
             ScanVerdict::Suspicious => {
@@ -256,7 +268,7 @@ fn check_bootstrapper_flag_array(
                         "{}: Suspicious FFlag \"{}\" = {}",
                         bootstrapper_name, flag_name, value
                     ),
-                    Some(format!("Path: {}", path.display())),
+                    Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
                 ));
             }
             ScanVerdict::Clean => {

@@ -1,4 +1,4 @@
-use crate::data::suspicious_flags::{CRITICAL_FLAGS, HIGH_FLAGS, MEDIUM_FLAGS};
+use crate::data::suspicious_flags::{CRITICAL_FLAGS, HIGH_FLAGS, MEDIUM_FLAGS, get_flag_category, get_flag_description};
 use crate::models::{ScanFinding, ScanVerdict};
 
 /// Known FFlag prefixes to search for in memory.
@@ -96,6 +96,11 @@ fn search_buffer_for_flags(
             if &buffer[i..i + flag_bytes.len()] == flag_bytes {
                 let severity = crate::data::suspicious_flags::get_flag_severity(flag_name);
                 let address = base_address + i;
+                let category = get_flag_category(flag_name).unwrap_or("UNKNOWN");
+                let desc = get_flag_description(flag_name);
+                let detail_suffix = desc
+                    .map(|d| format!(" | {}", d))
+                    .unwrap_or_default();
 
                 findings.push(ScanFinding::new(
                     "memory_scanner",
@@ -104,7 +109,7 @@ fn search_buffer_for_flags(
                         "FFlag found in Roblox memory: \"{}\"",
                         flag_name
                     ),
-                    Some(format!("Memory address: 0x{:X}", address)),
+                    Some(format!("Memory address: 0x{:X} | Category: {}{}", address, category, detail_suffix)),
                 ));
                 break; // Only report the first occurrence of each flag
             }
