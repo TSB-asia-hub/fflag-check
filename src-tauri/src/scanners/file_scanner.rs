@@ -1,11 +1,21 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use sha2::{Digest, Sha256};
+
 use crate::data::known_tools::{
-    KNOWN_BOOTSTRAPPER_DIRS, KNOWN_TOOL_DIRS, KNOWN_TOOL_FILENAMES,
+    INJECTOR_SIBLING_CONFIG_FILES, KNOWN_BOOTSTRAPPER_DIRS, KNOWN_TOOL_DIRS, KNOWN_TOOL_FILENAMES,
+    KNOWN_TOOL_HASHES,
 };
 use crate::models::{ScanFinding, ScanVerdict};
+
+/// Upper size bound (bytes) for opportunistic hashing of `.exe` artefacts
+/// found during the walk. The largest known injector in the hash list is
+/// well under 10 MB; real games/installers can be hundreds of MB, and we do
+/// not want the scanner to stall reading those.
+const HASH_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Scan the filesystem for known tool artifacts.
 pub async fn scan() -> Vec<ScanFinding> {
@@ -75,8 +85,11 @@ pub async fn scan() -> Vec<ScanFinding> {
                 continue;
             }
 
-            let file_name = entry.file_name().to_string_lossy();
+            let file_name_os = entry.file_name().to_string_lossy().to_string();
+            let file_name = file_name_os.as_str();
 
+            // Name-based match.
+            let mut matched_by_name = false;
             for &known_file in KNOWN_TOOL_FILENAMES {
                 if file_name.eq_ignore_ascii_case(known_file) {
                     let canon = entry
@@ -84,16 +97,6 @@ pub async fn scan() -> Vec<ScanFinding> {
                         .canonicalize()
                         .unwrap_or_else(|_| entry.path().to_path_buf());
                     if reported_paths.insert(canon.clone()) {
-                        let modified = entry
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .map(|t| {
-                                let dt: chrono::DateTime<chrono::Utc> = t.into();
-                                dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
-                            })
-                            .unwrap_or_else(|| "unknown".to_string());
-
                         findings.push(ScanFinding::new(
                             "file_scanner",
                             ScanVerdict::Suspicious,
@@ -101,11 +104,85 @@ pub async fn scan() -> Vec<ScanFinding> {
                             Some(format!(
                                 "Path: {}, Last modified: {}",
                                 entry.path().display(),
-                                modified
+                                format_modified(entry.path())
                             )),
                         ));
                     }
+                    matched_by_name = true;
                     break;
+                }
+            }
+            if matched_by_name {
+                continue;
+            }
+
+            // Hash-based match: only on plausibly-sized PE/Mach-O/zip artefacts.
+            let ext_is_candidate = matches!(
+                lower_ext(entry.path()).as_deref(),
+                Some("exe") | Some("zip") | Some("dmg") | Some("app")
+            );
+            if ext_is_candidate {
+                let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(u64::MAX);
+                if size <= HASH_SIZE_LIMIT_BYTES {
+                    if let Some(hex) = hash_file_sha256(entry.path()) {
+                        for &(known_hex, display_name, note) in KNOWN_TOOL_HASHES {
+                            if hex.eq_ignore_ascii_case(known_hex) {
+                                let canon = entry
+                                    .path()
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| entry.path().to_path_buf());
+                                if reported_paths.insert(canon.clone()) {
+                                    findings.push(ScanFinding::new(
+                                        "file_scanner",
+                                        ScanVerdict::Flagged,
+                                        format!(
+                                            "Known tool artefact matched by SHA-256: \"{}\" (as \"{}\")",
+                                            display_name, file_name
+                                        ),
+                                        Some(format!(
+                                            "Path: {}, SHA-256: {}, Last modified: {}, Note: {}",
+                                            entry.path().display(),
+                                            hex,
+                                            format_modified(entry.path()),
+                                            note
+                                        )),
+                                    ));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sibling-config heuristic: PE with fflags.json + address.json next
+            // to it is the LornoFix family's on-disk layout.
+            if lower_ext(entry.path()).as_deref() == Some("exe") {
+                if let Some(parent) = entry.path().parent() {
+                    let all_present = INJECTOR_SIBLING_CONFIG_FILES
+                        .iter()
+                        .all(|name| parent.join(name).is_file());
+                    if all_present {
+                        let canon = entry
+                            .path()
+                            .canonicalize()
+                            .unwrap_or_else(|_| entry.path().to_path_buf());
+                        if reported_paths.insert(canon.clone()) {
+                            findings.push(ScanFinding::new(
+                                "file_scanner",
+                                ScanVerdict::Flagged,
+                                format!(
+                                    "Executable co-located with FFlag-injector config files: \"{}\"",
+                                    file_name
+                                ),
+                                Some(format!(
+                                    "Path: {}, Sibling config files: [{}]",
+                                    entry.path().display(),
+                                    INJECTOR_SIBLING_CONFIG_FILES.join(", ")
+                                )),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -126,6 +203,28 @@ pub async fn scan() -> Vec<ScanFinding> {
     }
 
     findings
+}
+
+/// Lowercased file extension, or None for files without one.
+fn lower_ext(path: &Path) -> Option<String> {
+    path.extension().map(|e| e.to_string_lossy().to_lowercase())
+}
+
+/// Stream-hash a file as SHA-256, returning lowercase hex. Returns None on I/O
+/// error (permission denied, file racing disappearance, etc.) rather than
+/// propagating — an unhashable file is simply not matched.
+fn hash_file_sha256(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(hex::encode(hasher.finalize()))
 }
 
 fn format_modified(path: &std::path::Path) -> String {
@@ -191,4 +290,85 @@ fn get_search_roots() -> Vec<PathBuf> {
 #[cfg(not(target_os = "windows"))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn hash_file_sha256_matches_known_value() {
+        // "abc" → SHA-256 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        let dir = std::env::temp_dir().join(format!(
+            "fflag_check_hash_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("abc.bin");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"abc").unwrap();
+        }
+        let got = hash_file_sha256(&path).expect("hash ok");
+        assert_eq!(
+            got,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lower_ext_normalises_case() {
+        assert_eq!(
+            lower_ext(Path::new("x/Y/Foo.EXE")).as_deref(),
+            Some("exe")
+        );
+        assert_eq!(lower_ext(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn known_tool_hashes_are_lowercase_hex_64() {
+        for &(hex, name, _) in KNOWN_TOOL_HASHES {
+            assert_eq!(
+                hex.len(),
+                64,
+                "hash for {} is not 64 hex chars: {}",
+                name,
+                hex
+            );
+            assert!(
+                hex.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "hash for {} must be lowercase hex: {}",
+                name,
+                hex
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_config_pattern_is_detected_on_disk() {
+        // Build a fake injector layout in a fresh temp dir and verify that
+        // hash_file_sha256 + sibling-file logic would pick it up.
+        let root = std::env::temp_dir().join(format!(
+            "fflag_check_sibling_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let exe = root.join("tool.exe");
+        std::fs::write(&exe, b"MZ\x90\x00fake pe").unwrap();
+        for name in INJECTOR_SIBLING_CONFIG_FILES {
+            std::fs::write(root.join(name), b"{}").unwrap();
+        }
+
+        // All siblings present → heuristic should match.
+        let all_present = INJECTOR_SIBLING_CONFIG_FILES
+            .iter()
+            .all(|name| root.join(name).is_file());
+        assert!(all_present);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

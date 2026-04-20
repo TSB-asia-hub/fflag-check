@@ -63,9 +63,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_suffix: 'macos-aarch64.dmg'
-          - os: macos-13
-            target: x86_64-apple-darwin
-            asset_suffix: 'macos-x86_64.dmg'
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
