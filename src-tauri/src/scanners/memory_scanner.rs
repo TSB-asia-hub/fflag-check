@@ -860,7 +860,12 @@ mod windows_impl {
     pub(super) fn trusted_windows_roblox_roots() -> Vec<String> {
         // UWP locations are scoped to the ROBLOXCORPORATION package family
         // rather than the entire WindowsApps / Packages tree, so an unrelated
-        // UWP app cannot pass the trust check.
+        // UWP app cannot pass the trust check. Bloxstrap / Fishstrap install
+        // per-version Roblox copies under their own `Versions\` directory;
+        // these launchers are explicitly treated as legitimate elsewhere in
+        // the scanner (see KNOWN_BOOTSTRAPPER_DIRS), so refusing to scan
+        // their RobloxPlayerBeta.exe would leave the memory scanner
+        // effectively disabled for the majority of real users.
         let mut roots = Vec::new();
         if let Ok(pf) = std::env::var("ProgramFiles") {
             roots.push(format!("{}\\Roblox", pf));
@@ -872,6 +877,8 @@ mod windows_impl {
         if let Ok(local) = std::env::var("LocalAppData") {
             roots.push(format!("{}\\Roblox", local));
             roots.push(format!("{}\\Packages\\ROBLOXCORPORATION.", local));
+            roots.push(format!("{}\\Bloxstrap\\Versions\\", local));
+            roots.push(format!("{}\\Fishstrap\\Versions\\", local));
         }
         roots
     }
@@ -898,6 +905,11 @@ mod windows_impl {
             roots.push(format!("{}\\Roblox\\", local).to_lowercase());
             // Only Roblox UWP package family, not every per-user UWP package.
             roots.push(format!("{}\\Packages\\ROBLOXCORPORATION.", local).to_lowercase());
+            // Bloxstrap / Fishstrap ship legitimate Roblox binaries under
+            // these paths; required so modules loaded by a bootstrap-launched
+            // Roblox are not treated as untrusted.
+            roots.push(format!("{}\\Bloxstrap\\Versions\\", local).to_lowercase());
+            roots.push(format!("{}\\Fishstrap\\Versions\\", local).to_lowercase());
         }
 
         roots
@@ -946,6 +958,29 @@ mod tests {
 
     fn bytes(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
+    }
+
+    /// Regression guard: Bloxstrap / Fishstrap install Roblox under their
+    /// own `Versions\` subdirectories. Those launchers are explicitly
+    /// treated as legitimate elsewhere in the scanner, so the memory-scan
+    /// trust check must accept their RobloxPlayerBeta.exe paths — otherwise
+    /// a Bloxstrap-launched Roblox gets "untrusted path, refusing to scan"
+    /// and the memory scanner is effectively disabled for most real users.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn trust_roots_include_bloxstrap_and_fishstrap() {
+        // SAFETY: std::env::set_var is unsafe in Rust 2024 editions but the
+        // memory_scanner module is 2021 so this is still a plain fn call.
+        std::env::set_var("LocalAppData", "C:\\Users\\test\\AppData\\Local");
+        let roots = windows_impl::trusted_windows_roblox_roots();
+        let has_bloxstrap = roots.iter().any(|r| {
+            r.eq_ignore_ascii_case("C:\\Users\\test\\AppData\\Local\\Bloxstrap\\Versions\\")
+        });
+        let has_fishstrap = roots.iter().any(|r| {
+            r.eq_ignore_ascii_case("C:\\Users\\test\\AppData\\Local\\Fishstrap\\Versions\\")
+        });
+        assert!(has_bloxstrap, "Bloxstrap Versions path missing from trust list: {roots:?}");
+        assert!(has_fishstrap, "Fishstrap Versions path missing from trust list: {roots:?}");
     }
 
     #[test]
