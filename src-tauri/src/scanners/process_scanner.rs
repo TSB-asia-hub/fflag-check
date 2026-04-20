@@ -1,6 +1,9 @@
+use std::collections::HashSet;
 use sysinfo::System;
 
-use crate::data::known_tools::{KNOWN_PROCESS_NAMES, KNOWN_TOOL_FILENAMES};
+use crate::data::known_tools::{
+    KNOWN_BOOTSTRAPPER_PROCESS_NAMES, KNOWN_PROCESS_NAMES, KNOWN_TOOL_FILENAMES,
+};
 use crate::models::{ScanFinding, ScanVerdict};
 
 /// Scan running processes for known cheat/injection tools.
@@ -10,13 +13,18 @@ pub async fn scan() -> Vec<ScanFinding> {
     let mut sys = System::new_all();
     sys.refresh_all();
 
-    // Check if Roblox is running (higher severity if so)
     let roblox_running = sys.processes().values().any(|p| {
         let name = p.name().to_string_lossy().to_lowercase();
         name.contains("roblox")
     });
 
-    for (_pid, process) in sys.processes() {
+    // Each PID is reported at most once even if both name and filename rules fire.
+    let mut reported: HashSet<sysinfo::Pid> = HashSet::new();
+
+    for (pid, process) in sys.processes() {
+        if reported.contains(pid) {
+            continue;
+        }
         let proc_name = process.name().to_string_lossy().to_lowercase();
         let exe_path = process
             .exe()
@@ -28,50 +36,59 @@ pub async fn scan() -> Vec<ScanFinding> {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Check process name against known tool names (substring match)
+        let mut matched_via: Option<String> = None;
+
         for &known_name in KNOWN_PROCESS_NAMES {
             if proc_name.contains(known_name) {
-                let verdict = if roblox_running {
-                    ScanVerdict::Flagged
-                } else {
-                    ScanVerdict::Suspicious
-                };
-
-                findings.push(ScanFinding::new(
-                    "process_scanner",
-                    verdict,
-                    format!(
-                        "Known tool process detected: \"{}\" (matched: \"{}\")",
-                        process.name().to_string_lossy(),
-                        known_name
-                    ),
-                    Some(format!("PID: {}, Path: {}", _pid, exe_path)),
-                ));
-                break; // Only report once per process
+                matched_via = Some(format!("matched: \"{}\"", known_name));
+                break;
             }
         }
 
-        // Check exe filename against known tool filenames (case-insensitive)
-        if !exe_filename.is_empty() {
+        if matched_via.is_none() && !exe_filename.is_empty() {
             for &known_file in KNOWN_TOOL_FILENAMES {
                 if exe_filename.eq_ignore_ascii_case(known_file) {
-                    let verdict = if roblox_running {
-                        ScanVerdict::Flagged
-                    } else {
-                        ScanVerdict::Suspicious
-                    };
-
-                    findings.push(ScanFinding::new(
-                        "process_scanner",
-                        verdict,
-                        format!(
-                            "Known tool executable running: \"{}\"",
-                            exe_filename
-                        ),
-                        Some(format!("PID: {}, Path: {}", _pid, exe_path)),
-                    ));
+                    matched_via = Some(format!("filename: \"{}\"", known_file));
                     break;
                 }
+            }
+        }
+
+        if let Some(reason) = matched_via {
+            let verdict = if roblox_running {
+                ScanVerdict::Flagged
+            } else {
+                ScanVerdict::Suspicious
+            };
+            findings.push(ScanFinding::new(
+                "process_scanner",
+                verdict,
+                format!(
+                    "Known tool process detected: \"{}\" ({})",
+                    process.name().to_string_lossy(),
+                    reason
+                ),
+                Some(format!("PID: {}, Path: {}", pid, exe_path)),
+            ));
+            reported.insert(*pid);
+            continue;
+        }
+
+        // Legitimate bootstrapper launchers — informational only, never raise
+        // the verdict. Per Roblox policy these are not cheat indicators.
+        for &boot_name in KNOWN_BOOTSTRAPPER_PROCESS_NAMES {
+            if proc_name.contains(boot_name) {
+                findings.push(ScanFinding::new(
+                    "process_scanner",
+                    ScanVerdict::Clean,
+                    format!(
+                        "Bootstrapper running: \"{}\" (legitimate launcher; not a cheat indicator)",
+                        process.name().to_string_lossy()
+                    ),
+                    Some(format!("PID: {}, Path: {}", pid, exe_path)),
+                ));
+                reported.insert(*pid);
+                break;
             }
         }
     }

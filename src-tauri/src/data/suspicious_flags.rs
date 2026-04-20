@@ -84,7 +84,7 @@ pub static CRITICAL_FLAGS: &[&str] = &[
     "DFIntSimExplicitlyCappedTimestepMultiplier",
     "DFIntMaxTimestepMultiplierAcceleration",
     "DFIntMaxTimestepMultiplierBuoyancy",
-    "DFIntMaxTimestepMultiplierContstraint",
+    "DFIntMaxTimestepMultiplierConstraint",
     "DFIntTimestepArbiterVelocityCriteriaThresholdTwoDt",
     "DFIntTimestepArbiterHumanoidTurningVelThreshold",
     "DFIntTimestepArbiterOmegaThou",
@@ -132,7 +132,7 @@ pub static CRITICAL_FLAGS: &[&str] = &[
 
     // ---- Data packet / bandwidth manipulation ----
     "DFIntMaxDataPacketPerSend",
-    "DFIntServerMaxBandwith",
+    "DFIntServerMaxBandwidth",
     "DFIntAngularVelocityLimit",
 
     // ---- Max active animation tracks (animation freeze) ----
@@ -214,9 +214,11 @@ pub static HIGH_FLAGS: &[&str] = &[
     "DFIntAnimationLodFacsVisibilityDenominator",
 
     // ---- Texture removal / stripping (see through surfaces) ----
-    // Override texture quality to minimum
-    "DFFlagTextureQualityOverrideEnabled",
-    "DFIntTextureQualityOverride",
+    // (DFFlagTextureQualityOverrideEnabled and DFIntTextureQualityOverride
+    // are on Roblox's official allowlist — see flag_allowlist.rs — so they
+    // can never trigger here. Removed from this tier to keep the catalog
+    // honest; if tournament policy needs to override Roblox's allowlist,
+    // delete the corresponding entry from flag_allowlist.rs first.)
     // Skip mip levels (reduce textures to near-invisible)
     "FIntDebugTextureManagerSkipMips",
     // Remove part textures entirely
@@ -277,20 +279,21 @@ pub static HIGH_FLAGS: &[&str] = &[
     "FFlagTrackerLodControllerDebugUI",
 
     // ---- Particle / sky / visual stripping ----
-    "FFlagDebugSkyGray",
+    // (FFlagDebugSkyGray and DFFlagDebugPauseVoxelizer are on Roblox's
+    // allowlist; removed here to avoid the dead-entry confusion.)
     "FFlagDebugDeterministicParticles",
-    "DFFlagDebugPauseVoxelizer",
 
     // ---- SSAO manipulation ----
     "FFlagDebugSSAOForce",
     "FIntSSAOMipLevels",
 
     // ---- Grass stripping beyond allowlist values ----
+    // (FIntFRMMinGrassDistance, FIntFRMMaxGrassDistance, and
+    // FIntGrassMovementReducedMotionFactor are on Roblox's allowlist —
+    // removed from this tier. FIntRenderGrassDetailStrands and
+    // FIntRenderGrassHeightScaler are NOT on the allowlist and stay.)
     "FIntRenderGrassDetailStrands",
     "FIntRenderGrassHeightScaler",
-    "FIntFRMMinGrassDistance",
-    "FIntFRMMaxGrassDistance",
-    "FIntGrassMovementReducedMotionFactor",
 
     // ---- Viewport manipulation ----
     "FIntViewportFrameMaxSize",
@@ -366,7 +369,8 @@ pub static MEDIUM_FLAGS: &[&str] = &[
     "FLogNetwork",
 
     // ---- Graphics quality override ----
-    "DFIntDebugFRMQualityLevelOverride",
+    // (DFIntDebugFRMQualityLevelOverride is on Roblox's allowlist —
+    // removed; the others stay.)
     "FIntRomarkStartWithGraphicQualityLevel",
     "FFlagCommitToGraphicsQualityFix",
     "FFlagFixGraphicsQuality",
@@ -379,18 +383,16 @@ pub static MEDIUM_FLAGS: &[&str] = &[
     // ---- New light attenuation ----
     "FFlagNewLightAttenuation",
 
-    // ---- CSG LOD switching (allowlisted but abusable with extreme values) ----
-    "DFIntCSGLevelOfDetailSwitchingDistance",
-    "DFIntCSGLevelOfDetailSwitchingDistanceL12",
-    "DFIntCSGLevelOfDetailSwitchingDistanceL23",
-    "DFIntCSGLevelOfDetailSwitchingDistanceL34",
+    // ---- CSG LOD switching ----
+    // (The four DFIntCSGLevelOfDetailSwitchingDistance* flags are on
+    // Roblox's allowlist — removed. CSGv2LodsToGenerate is not.)
     "DFIntCSGv2LodsToGenerate",
 
     // ---- Frame buffer manipulation ----
     "DFIntMaxFrameBufferSize",
 
     // ---- MSAA manipulation ----
-    "FIntDebugForceMSAASamples",
+    // (FIntDebugForceMSAASamples is allowlisted — removed.)
 
     // ---- Threading manipulation ----
     "FIntRuntimeMaxNumOfThreads",
@@ -403,7 +405,7 @@ pub static MEDIUM_FLAGS: &[&str] = &[
     "FFlagDebugRenderingSetDeterministic",
 
     // ---- DPI scale manipulation ----
-    "DFFlagDisableDPIScale",
+    // (DFFlagDisableDPIScale is allowlisted — removed.)
 
     // ---- UI manipulation ----
     "FFlagEnableInGameMenuChromeABTest2",
@@ -509,21 +511,22 @@ pub static MEDIUM_FLAGS: &[&str] = &[
 // =============================================================================
 pub static LOW_FLAGS: &[&str] = &[
     // ---- Graphics API preferences (beyond allowlisted set) ----
+    // (FFlagDebugGraphicsPreferD3D11 / PreferOpenGL / PreferVulkan are
+    // allowlisted — removed. The remaining entries are non-allowlisted
+    // graphics-API tweaks.)
     "FFlagDebugGraphicsDisableDirect3D11",
-    "FFlagDebugGraphicsPreferOpenGL",
     "FFlagDebugGraphicsPreferD3D11FL10",
-    "FFlagDebugGraphicsPreferD3D11",
     "FFlagDebugGraphicsPreferMetal",
     "FFlagGraphicsEnableD3D10Compute",
     "FFlagDebugGraphicsDisableVulkan",
     "FFlagDebugGraphicsDisableVulkan11",
     "FFlagRenderVulkanFixMinimizeWindow",
 
-    // ---- Fullscreen handling (allowlisted but listed for completeness) ----
-    "FFlagHandleAltEnterFullscreenManually",
-
-    // ---- Grass reduced motion (allowlisted) ----
-    "FFlagGrassReducedMotion",
+    // (FFlagHandleAltEnterFullscreenManually and FFlagGrassReducedMotion
+    // were previously listed here for "completeness" but are allowlisted /
+    // don't exist as real flag names — removed to keep the catalog honest.
+    // The real allowlisted reduced-motion flag is the int
+    // `FIntGrassMovementReducedMotionFactor`, which lives in flag_allowlist.)
 
     // ---- Compression ----
     "DFFlagEnableRequestAsyncCompression",
@@ -574,7 +577,7 @@ pub fn get_flag_category(flag_name: &str) -> Option<&'static str> {
 pub fn get_flag_description(flag_name: &str) -> Option<&'static str> {
     match flag_name {
         // === CRITICAL: Physics / Desync ===
-        "DFIntS2PhysicsSenderRate" => Some("Physics sender rate: controls how often physics data reaches the server. Exploit values (1, -30, 30000) cause desync/invisibility."),
+        "DFIntS2PhysicsSenderRate" => Some("Physics sender rate: controls how often physics data reaches the server. Documented exploit value 1 (updates dropped to once/sec) causes server-side desync."),
         "DFIntS2PhysicSenderRate" => Some("Typo variant of physics sender rate; same desync effect."),
         "DFIntPhysicsSenderMaxBandwidthBps" => Some("Caps physics replication bandwidth. Value 1 starves server of position updates."),
         "DFIntPhysicsSenderMaxBandwidthBpsScaling" => Some("Scaling factor for physics sender bandwidth; 0 disables scaling."),

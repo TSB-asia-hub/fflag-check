@@ -1,6 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Component, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ScanFinding, ScanReport, ScanVerdict } from "./types";
+
+// Version is wired in at build time from package.json by Vite's __APP_VERSION__
+// define (see vite.config.ts); fall back to "?" if the define is missing.
+declare const __APP_VERSION__: string;
+const APP_VERSION =
+  typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "?";
 
 type Phase = "idle" | "scanning" | "complete";
 type Filter = "all" | "flagged" | "suspicious" | "clean";
@@ -28,12 +34,15 @@ function hasTauriRuntime(): boolean {
 }
 
 // Stable per-finding identity so open-state and React keys track the
-// finding itself, not its position in the filtered list.
+// finding itself, not its position in the filtered list. Includes the
+// `details` field so two findings with identical module+timestamp+description
+// (which can happen on batch scans hitting Utc::now() in the same tick)
+// still get distinct keys when their details differ.
 function findingKey(f: ScanFinding): string {
-  return `${f.module}|${f.timestamp}|${f.description}`;
+  return `${f.module}|${f.timestamp}|${f.description}|${f.details ?? ""}`;
 }
 
-export default function App() {
+function AppInner() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [report, setReport] = useState<ScanReport | null>(null);
   const [activeScanner, setActiveScanner] = useState(0);
@@ -41,6 +50,8 @@ export default function App() {
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [tauriReady, setTauriReady] = useState<boolean>(() => hasTauriRuntime());
+  const [exportInFlight, setExportInFlight] = useState(false);
+  const scanInFlight = useRef(false);
 
   // The Tauri runtime is injected synchronously in the real webview, but if
   // the first render raced the injection (some loader orderings), re-check
@@ -71,6 +82,7 @@ export default function App() {
   }, [filter]);
 
   const runScan = useCallback(async () => {
+    if (scanInFlight.current) return;
     if (!hasTauriRuntime()) {
       setToast({
         msg: "Tauri runtime not detected — launch the app with `npm run tauri dev` or the installed .app, not `npm run dev`.",
@@ -78,6 +90,7 @@ export default function App() {
       });
       return;
     }
+    scanInFlight.current = true;
     setPhase("scanning");
     setReport(null);
     setOpenKey(null);
@@ -90,22 +103,31 @@ export default function App() {
     } catch (err) {
       setToast({ msg: `Scan failed: ${String(err)}`, kind: "error" });
       setPhase("idle");
+    } finally {
+      scanInFlight.current = false;
     }
   }, []);
 
   const exportReport = useCallback(async () => {
-    if (!report) return;
+    if (!report || exportInFlight) return;
     if (!hasTauriRuntime()) {
       setToast({ msg: "Tauri runtime not detected — cannot export.", kind: "error" });
       return;
     }
+    setExportInFlight(true);
     try {
-      const path = await invoke<string>("save_report", { report });
+      // The backend re-runs scanners and signs in-memory; we deliberately
+      // do NOT pass the on-screen report here. This means the saved file
+      // reflects the current machine state at export time, not whatever
+      // (potentially tampered) report the webview is holding.
+      const path = await invoke<string>("save_report");
       setToast({ msg: `Report saved → ${path}`, kind: "success" });
     } catch (err) {
       setToast({ msg: `Export failed: ${String(err)}`, kind: "error" });
+    } finally {
+      setExportInFlight(false);
     }
-  }, [report]);
+  }, [report, exportInFlight]);
 
   const counts = useMemo(() => {
     if (!report) return { clean: 0, suspicious: 0, flagged: 0, total: 0 };
@@ -149,6 +171,7 @@ export default function App() {
         onScan={runScan}
         onExport={exportReport}
         disabled={!tauriReady}
+        exportInFlight={exportInFlight}
       />
       <Summary
         phase={phase}
@@ -180,12 +203,14 @@ function Toolbar({
   onScan,
   onExport,
   disabled = false,
+  exportInFlight = false,
 }: {
   phase: Phase;
   report: ScanReport | null;
   onScan: () => void;
   onExport: () => void;
   disabled?: boolean;
+  exportInFlight?: boolean;
 }) {
   const lastScan =
     phase === "scanning"
@@ -223,8 +248,12 @@ function Toolbar({
       </div>
       <div className="toolbar__right">
         {phase === "complete" && report && (
-          <button className="btn btn--ghost" onClick={onExport} disabled={disabled}>
-            Export
+          <button
+            className="btn btn--ghost"
+            onClick={onExport}
+            disabled={disabled || exportInFlight}
+          >
+            {exportInFlight ? "Saving…" : "Export"}
           </button>
         )}
         <button
@@ -386,6 +415,8 @@ function Workarea({
           {chips.map((c) => (
             <button
               key={c.key}
+              type="button"
+              aria-pressed={filter === c.key}
               className={`filter-chip ${c.modifier} ${filter === c.key ? "filter-chip--active" : ""}`}
               onClick={() => onFilter(c.key)}
             >
@@ -446,14 +477,33 @@ function Workarea({
           const key = findingKey(f);
           const open = openKey === key;
           const cls = `row row--${f.verdict.toLowerCase()} ${open ? "row--open" : ""}`;
+          // Verdict glyph supplements color so colorblind users still see severity.
+          const glyph =
+            f.verdict === "Flagged" ? "✕" : f.verdict === "Suspicious" ? "▲" : "•";
           return (
-            <div key={key} className={cls} onClick={() => onToggle(key)}>
-              <span className="row__bar" />
+            <div
+              key={key}
+              className={cls}
+              role="button"
+              tabIndex={0}
+              aria-expanded={open}
+              aria-label={`${f.verdict} finding from ${f.module}: ${f.description}. Press Enter to ${open ? "collapse" : "expand"}.`}
+              onClick={() => onToggle(key)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onToggle(key);
+                }
+              }}
+            >
+              <span className="row__bar" aria-hidden="true" />
               <span className="row__module">{f.module}</span>
               <span className="row__desc">{f.description}</span>
-              <span className="row__verdict">{f.verdict.toLowerCase()}</span>
+              <span className="row__verdict">
+                <span aria-hidden="true">{glyph}</span> {f.verdict.toLowerCase()}
+              </span>
               <span className="row__time">{shortTime(f.timestamp)}</span>
-              <span className="row__caret">›</span>
+              <span className="row__caret" aria-hidden="true">›</span>
               <div className="row__details">
                 <div className="row__details-inner">
                   {f.details ?? "No additional details."}
@@ -501,7 +551,7 @@ function StatusBar({
           {state}
         </span>
         <span className="statusbar__sep">·</span>
-        <span>TSBCC v0.1.0</span>
+        <span>TSBCC v{APP_VERSION}</span>
       </div>
       <div className="statusbar__group">
         <span>Local only</span>
@@ -509,6 +559,57 @@ function StatusBar({
         <span>HMAC-SHA256</span>
       </div>
     </footer>
+  );
+}
+
+/* ——————————————————————————————————————————————————————————— */
+
+/* ——————————————————————————————————————————————————————————— */
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: { componentStack?: string | null }) {
+    // eslint-disable-next-line no-console
+    console.error("UI error boundary caught:", error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="empty" style={{ padding: "32px 16px" }}>
+          <span className="empty__title">Something broke in the UI</span>
+          <span className="empty__hint">
+            {this.state.error.message || "Unknown error"}
+          </span>
+          <button
+            className="btn btn--ghost"
+            onClick={() => {
+              this.setState({ error: null });
+              if (typeof window !== "undefined") window.location.reload();
+            }}
+          >
+            Reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
   );
 }
 

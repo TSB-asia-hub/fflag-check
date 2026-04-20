@@ -1,4 +1,6 @@
-use crate::models::{ScanFinding, ScanVerdict};
+use crate::models::ScanFinding;
+#[cfg(not(target_os = "windows"))]
+use crate::models::ScanVerdict;
 
 /// Scan Windows Prefetch files for evidence of known tools.
 /// Returns empty on non-Windows platforms.

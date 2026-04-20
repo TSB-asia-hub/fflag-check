@@ -1,13 +1,13 @@
 [package]
 name = "fflag-check"
-version = "0.2.0"
-description = "TSBCC FFlag Scanner"
-authors = ["you"]
+version = "0.3.0"
+description = "TSBCC FFlag Scanner — tournament integrity tool for Roblox FFlag detection"
+authors = ["TSBCC"]
 edition = "2021"
 
 [lib]
 name = "fflag_check_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -18,21 +18,21 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sysinfo = "0.33"
+sysinfo = "0.38"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 glob = "0.3"
 walkdir = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = [
-    "processthreadsapi", "memoryapi", "handleapi",
-    "tlhelp32", "winnt", "psapi", "securitybaseapi",
-    "wow64apiset", "errhandlingapi"
+# Microsoft's official bindings, replacing the unmaintained winapi 0.3.
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
 ] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-mach2 = "0.4"

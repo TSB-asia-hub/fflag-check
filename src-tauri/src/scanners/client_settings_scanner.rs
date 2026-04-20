@@ -15,16 +15,12 @@ pub async fn scan() -> Vec<ScanFinding> {
             continue;
         }
 
-        findings.push(ScanFinding::new(
-            "client_settings_scanner",
-            ScanVerdict::Suspicious,
-            "ClientAppSettings.json file exists (this folder is not created by default)",
-            Some(format!("Path: {}", path.display())),
-        ));
-
+        let before = findings.len();
+        let parse_failed;
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 check_flat_json_flags(&content, path, &mut findings);
+                parse_failed = false;
             }
             Err(e) => {
                 findings.push(ScanFinding::new(
@@ -33,8 +29,31 @@ pub async fn scan() -> Vec<ScanFinding> {
                     format!("Could not read ClientAppSettings.json: {}", e),
                     Some(format!("Path: {}", path.display())),
                 ));
+                parse_failed = true;
             }
         }
+
+        // Emit the file-existence note. Verdict is Clean if every flag inside
+        // was on Roblox's official allowlist (in which case the file's mere
+        // presence is permitted by Roblox policy); otherwise Suspicious,
+        // because a non-default file containing non-allowlisted flags is
+        // tampering evidence.
+        let any_non_clean = findings[before..]
+            .iter()
+            .any(|f| !matches!(f.verdict, ScanVerdict::Clean));
+        let is_clean = !any_non_clean && !parse_failed;
+        let verdict = if is_clean { ScanVerdict::Clean } else { ScanVerdict::Suspicious };
+        let msg = if is_clean {
+            "ClientAppSettings.json present, contents are within Roblox's official allowlist"
+        } else {
+            "ClientAppSettings.json file exists (this folder is not created by default)"
+        };
+        findings.push(ScanFinding::new(
+            "client_settings_scanner",
+            verdict,
+            msg,
+            Some(format!("Path: {}", path.display())),
+        ));
     }
 
     // 2. Check bootstrapper configs (AppleBlox, Bloxstrap, etc.)
@@ -106,12 +125,24 @@ fn check_flat_json_flags(content: &str, path: &PathBuf, findings: &mut Vec<ScanF
                 ));
             }
             ScanVerdict::Clean => {
-                findings.push(ScanFinding::new(
-                    "client_settings_scanner",
-                    ScanVerdict::Suspicious,
-                    format!("Unknown non-allowlisted FFlag: \"{}\" = {}", key, value),
-                    Some(format!("Path: {}", path.display())),
-                ));
+                // get_flag_severity returns Clean for both LOW-tier known flags
+                // and truly-unknown flags. Distinguish the two so operators see
+                // an accurate label and (where available) the description.
+                if get_flag_category(key).is_some() {
+                    findings.push(ScanFinding::new(
+                        "client_settings_scanner",
+                        ScanVerdict::Suspicious,
+                        format!("Low-severity FFlag detected: \"{}\" = {}", key, value),
+                        Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
+                    ));
+                } else {
+                    findings.push(ScanFinding::new(
+                        "client_settings_scanner",
+                        ScanVerdict::Suspicious,
+                        format!("Unknown non-allowlisted FFlag: \"{}\" = {}", key, value),
+                        Some(format!("Path: {}", path.display())),
+                    ));
+                }
             }
         }
     }
@@ -128,21 +159,35 @@ fn scan_bootstrapper_configs(findings: &mut Vec<ScanFinding>) {
                 continue;
             }
 
-            findings.push(ScanFinding::new(
-                "client_settings_scanner",
-                ScanVerdict::Suspicious,
-                format!("{} configuration found", bootstrapper_name),
-                Some(format!("Path: {}", path.display())),
-            ));
+            // Bootstrappers themselves are legitimate launchers per Roblox
+            // policy — only the *contents* of their config file determine
+            // whether this rises above an informational finding.
+            let before = findings.len();
 
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(_) => {
+                    findings.push(ScanFinding::new(
+                        "client_settings_scanner",
+                        ScanVerdict::Clean,
+                        format!("{} configuration found (unreadable)", bootstrapper_name),
+                        Some(format!("Path: {}", path.display())),
+                    ));
+                    continue;
+                }
             };
 
             let parsed: serde_json::Value = match serde_json::from_str(&content) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    findings.push(ScanFinding::new(
+                        "client_settings_scanner",
+                        ScanVerdict::Clean,
+                        format!("{} configuration found (unparseable)", bootstrapper_name),
+                        Some(format!("Path: {}", path.display())),
+                    ));
+                    continue;
+                }
             };
 
             // AppleBlox format: { "flags": [ { "flag": "Name", "enabled": true, "value": "X" }, ... ] }
@@ -200,6 +245,31 @@ fn scan_bootstrapper_configs(findings: &mut Vec<ScanFinding>) {
                     check_flat_json_flags(&content, &path, findings);
                 }
             }
+
+            // Now decide the verdict for the bootstrapper-config-presence
+            // finding itself, based on whether the contents produced any
+            // non-Clean findings. If all the FFlags inside were on Roblox's
+            // allowlist (or the file was config-only with no FFlags at all),
+            // a bootstrapper config is just an informational signal.
+            let any_non_clean = findings[before..]
+                .iter()
+                .any(|f| !matches!(f.verdict, ScanVerdict::Clean));
+            let is_clean = !any_non_clean;
+            let verdict = if is_clean { ScanVerdict::Clean } else { ScanVerdict::Suspicious };
+            let msg = if is_clean {
+                format!(
+                    "{} configuration found, contents are within Roblox's allowlist (legitimate launcher)",
+                    bootstrapper_name
+                )
+            } else {
+                format!("{} configuration found", bootstrapper_name)
+            };
+            findings.push(ScanFinding::new(
+                "client_settings_scanner",
+                verdict,
+                msg,
+                Some(format!("Path: {}", path.display())),
+            ));
         }
     }
 }
@@ -272,15 +342,27 @@ fn check_bootstrapper_flag_array(
                 ));
             }
             ScanVerdict::Clean => {
-                findings.push(ScanFinding::new(
-                    "client_settings_scanner",
-                    ScanVerdict::Suspicious,
-                    format!(
-                        "{}: Non-allowlisted FFlag \"{}\" = {}",
-                        bootstrapper_name, flag_name, value
-                    ),
-                    Some(format!("Path: {}", path.display())),
-                ));
+                if get_flag_category(flag_name).is_some() {
+                    findings.push(ScanFinding::new(
+                        "client_settings_scanner",
+                        ScanVerdict::Suspicious,
+                        format!(
+                            "{}: Low-severity FFlag \"{}\" = {}",
+                            bootstrapper_name, flag_name, value
+                        ),
+                        Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
+                    ));
+                } else {
+                    findings.push(ScanFinding::new(
+                        "client_settings_scanner",
+                        ScanVerdict::Suspicious,
+                        format!(
+                            "{}: Non-allowlisted FFlag \"{}\" = {}",
+                            bootstrapper_name, flag_name, value
+                        ),
+                        Some(format!("Path: {}", path.display())),
+                    ));
+                }
             }
         }
     }
@@ -317,16 +399,21 @@ fn get_client_settings_paths() -> Vec<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
+        // Native macOS Roblox stores ClientAppSettings inside the .app bundle
+        // (per https://devforum.roblox.com/t/3180597). The legacy
+        // ~/Library/Roblox/ClientSettings path is also kept as a fallback.
+        paths.push(PathBuf::from(
+            "/Applications/Roblox.app/Contents/MacOS/ClientSettings/ClientAppSettings.json",
+        ));
         if let Ok(home) = std::env::var("HOME") {
             let home_path = PathBuf::from(&home);
-
-            // Primary macOS path: ~/Library/Roblox/ClientSettings/ClientAppSettings.json
-            let roblox_path = home_path
-                .join("Library")
-                .join("Roblox")
-                .join("ClientSettings")
-                .join("ClientAppSettings.json");
-            paths.push(roblox_path);
+            paths.push(
+                home_path
+                    .join("Library")
+                    .join("Roblox")
+                    .join("ClientSettings")
+                    .join("ClientAppSettings.json"),
+            );
         }
     }
 
@@ -417,4 +504,62 @@ fn get_bootstrapper_config_paths() -> Vec<(&'static str, Vec<PathBuf>)> {
     }
 
     configs
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "fflag-check-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn allowlisted_only_file_is_clean() {
+        // A file containing nothing but Roblox's officially-allowlisted
+        // flags must not produce any Suspicious or Flagged findings.
+        let json =
+            r#"{"FFlagDebugGraphicsPreferD3D11": true, "FIntDebugForceMSAASamples": 4}"#;
+        let dir = tmpdir();
+        let path = dir.join("ClientAppSettings.json");
+        std::fs::write(&path, json).unwrap();
+
+        let mut findings = Vec::new();
+        check_flat_json_flags(json, &path, &mut findings);
+
+        for f in &findings {
+            assert!(
+                matches!(f.verdict, ScanVerdict::Clean),
+                "allowlisted-only file produced non-Clean finding: {:?}",
+                f
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_allowlisted_flag_is_flagged() {
+        // A critical flag must produce a Flagged verdict.
+        let json = r#"{"DFIntS2PhysicsSenderRate": 1}"#;
+        let dir = tmpdir();
+        let path = dir.join("ClientAppSettings.json");
+
+        let mut findings = Vec::new();
+        check_flat_json_flags(json, &path, &mut findings);
+
+        let any_flagged = findings.iter().any(|f| matches!(f.verdict, ScanVerdict::Flagged));
+        assert!(any_flagged, "DFIntS2PhysicsSenderRate must produce a Flagged verdict; got: {:?}", findings);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -693,7 +693,13 @@ button {
   .summary__cell--divider { border-left: none; border-right: none; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
   .table-head,
   .row { grid-template-columns: 4px 1fr 80px 24px; }
-  .table-head__module, .table-head__time, .row__module, .row__time { display: none; }
+  /* Hide module + time columns on narrow viewports. The table-head uses
+     unclassed <span> children, so target by position. The trailing
+     :nth-child(6) is the empty caret slot, which we keep for alignment. */
+  .table-head > span:nth-child(2),
+  .table-head > span:nth-child(5),
+  .row__module,
+  .row__time { display: none; }
   .row__details { grid-column: 2 / 4; }
   .toolbar__meta { display: none; }
 }

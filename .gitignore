@@ -4,6 +4,10 @@ src-tauri/target/
 # Node
 node_modules/
 dist/
+dist-tsconfig-node/
+
+# TypeScript build info
+*.tsbuildinfo
 
 # OS
 .DS_Store
@@ -12,6 +16,9 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Claude Code workspace
+.claude/
 
 # Tauri
 src-tauri/gen/

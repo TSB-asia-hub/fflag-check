@@ -20,13 +20,13 @@ pub fn generate_report(findings: Vec<ScanFinding>) -> ScanReport {
 }
 
 /// Save a scan report as JSON to the user's desktop.
-/// Verifies the HMAC before writing so a tampered frontend-supplied report
-/// cannot produce a file whose signature disagrees with its contents.
-/// Returns the file path on success.
+/// The caller (`commands::save_report`) generates the report from a fresh
+/// in-process scan, so we own its provenance. We still verify the signature
+/// here as a defense-in-depth check against bugs in the signing pipeline.
 pub fn save_report(report: &ScanReport) -> Result<String, String> {
     if !report.verify() {
         return Err(
-            "Report HMAC signature is invalid — refusing to save a tampered report.".to_string(),
+            "Report HMAC signature is invalid — refusing to save (signing pipeline bug?).".to_string(),
         );
     }
 
@@ -48,12 +48,14 @@ pub fn save_report(report: &ScanReport) -> Result<String, String> {
     Ok(file_path.to_string_lossy().to_string())
 }
 
-/// Validate a report's HMAC signature from its JSON representation.
+/// Validate a report's HMAC signature AND its freshness window.
+/// Returns Ok(true) on success; Ok(false) if signature/freshness fails;
+/// Err if the JSON itself can't be parsed.
 pub fn validate_report(json: &str) -> Result<bool, String> {
     let report: ScanReport =
         serde_json::from_str(json).map_err(|e| format!("Invalid report JSON: {}", e))?;
 
-    Ok(report.verify())
+    Ok(report.verify_fresh().is_ok())
 }
 
 /// Get the user's desktop path.

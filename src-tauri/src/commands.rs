@@ -2,7 +2,10 @@ use crate::models::ScanReport;
 use crate::reports::report_generator;
 use crate::scanners;
 
-/// Run all scanners and generate a signed scan report.
+/// Run all scanners and generate a signed scan report. The signed report is
+/// returned to the frontend for display only — when the user exports, the
+/// backend re-runs scanners rather than trusting the frontend copy (see
+/// `save_report`).
 #[tauri::command]
 pub async fn run_scan() -> Result<ScanReport, String> {
     let findings = scanners::run_all_scans().await;
@@ -10,14 +13,21 @@ pub async fn run_scan() -> Result<ScanReport, String> {
     Ok(report)
 }
 
-/// Save a scan report to the user's desktop as a JSON file.
-/// Returns the file path where the report was saved.
+/// Save a freshly-generated, in-memory-signed report to disk. The frontend
+/// CANNOT supply the report content — `save_report` re-runs scanners and
+/// signs the result internally, so a tampered webview cannot persist a
+/// forged "Clean" report. Returns the file path where the report was saved.
 #[tauri::command]
-pub async fn save_report(report: ScanReport) -> Result<String, String> {
+pub async fn save_report() -> Result<String, String> {
+    let findings = scanners::run_all_scans().await;
+    let report = report_generator::generate_report(findings);
     report_generator::save_report(&report)
 }
 
-/// Validate a report's HMAC signature from its JSON string.
+/// Validate a report's HMAC signature AND its freshness window. A report
+/// older than the configured age (~30 minutes) is rejected even if the
+/// signature is valid, closing the trivial replay-attack vector where a
+/// player keeps a one-time Clean report for future tournaments.
 #[tauri::command]
 pub async fn validate_report(json: String) -> Result<bool, String> {
     report_generator::validate_report(&json)
