@@ -5,7 +5,7 @@ export interface ScanFinding {
   verdict: ScanVerdict;
   description: string;
   details: string | null;
-  timestamp: string; // ISO 8601
+  timestamp: string;
 }
 
 export interface ScanReport {
@@ -17,10 +17,3 @@ export interface ScanReport {
   findings: ScanFinding[];
   hmac_signature: string;
 }
-
-// UI state types
-export type ScanPhase =
-  | "idle"
-  | "scanning"
-  | "complete"
-  | "error";

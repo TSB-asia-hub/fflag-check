@@ -20,8 +20,16 @@ pub fn generate_report(findings: Vec<ScanFinding>) -> ScanReport {
 }
 
 /// Save a scan report as JSON to the user's desktop.
+/// Verifies the HMAC before writing so a tampered frontend-supplied report
+/// cannot produce a file whose signature disagrees with its contents.
 /// Returns the file path on success.
 pub fn save_report(report: &ScanReport) -> Result<String, String> {
+    if !report.verify() {
+        return Err(
+            "Report HMAC signature is invalid — refusing to save a tampered report.".to_string(),
+        );
+    }
+
     let desktop = get_desktop_path().ok_or_else(|| "Could not determine desktop path".to_string())?;
 
     if !desktop.exists() {
