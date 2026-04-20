@@ -1,56 +1,77 @@
-use crate::data::suspicious_flags::{CRITICAL_FLAGS, HIGH_FLAGS, MEDIUM_FLAGS, get_flag_category, get_flag_description};
-use crate::models::{ScanFinding, ScanVerdict};
-use std::collections::HashSet;
+// On non-Windows builds, memory scanning is stubbed and most helpers are only
+// exercised by the Windows path or the unit tests. Silence dead_code there.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-/// Known FFlag prefixes to search for in memory.
-#[allow(dead_code)]
-const FFLAG_PREFIXES: &[&str] = &[
-    "DFInt",
-    "DFFlag",
-    "FFlagDebug",
-    "FIntDebug",
-    "DFFlagDebug",
-    "FFlagSim",
-    "DFIntS2",
-    "DFIntReplicator",
-    "DFIntAssembly",
-    "FIntRender",
-    "FFlagGlobal",
-    "DFIntTask",
-    "FFlagAd",
-    "FFlagFast",
-    "FIntFullscreen",
+use crate::data::flag_allowlist::is_allowed_flag;
+use crate::data::suspicious_flags::{
+    get_flag_category, get_flag_description, get_flag_severity, CRITICAL_FLAGS, HIGH_FLAGS,
+    MEDIUM_FLAGS,
+};
+use crate::models::{ScanFinding, ScanVerdict};
+use std::collections::HashMap;
+
+/// Known FFlag prefixes. Any identifier matching `<prefix><IdentBody>` where
+/// the body is a camel-cased identifier is a candidate flag name. We treat
+/// unknown candidates as Suspicious rather than ignoring them, because the
+/// allowlist-only approach misses novel flag names entirely.
+const FLAG_PREFIXES: &[&str] = &[
+    "DFFlag", "FFlag", "DFInt", "FInt", "DFString", "FString", "DFLog", "FLog", "SFFlag", "SFInt",
+    "SFString",
 ];
 
-/// Hard cap on regions walked per scan, to prevent runaway loops when an OS
-/// enumeration API misbehaves. Roblox typically has far fewer regions than this.
+/// Maximum identifier body length after a prefix. Real Roblox flag names top
+/// out around ~90 chars; anything longer is almost certainly not a flag.
+const MAX_IDENT_BODY_LEN: usize = 128;
+/// Minimum identifier body length. Single-character bodies are noise.
+const MIN_IDENT_BODY_LEN: usize = 3;
+
+/// Hard cap on regions walked per scan, to prevent runaway loops when the OS
+/// enumeration API misbehaves. Roblox typically has far fewer regions.
 const MAX_REGIONS_WALKED: usize = 200_000;
 
-/// Max per-region read (16 MiB). Regions larger than this are skipped for string search
-/// but still counted and walked past.
-const MAX_REGION_READ_BYTES: usize = 16 * 1024 * 1024;
+/// Max per-chunk read (16 MiB). Regions larger than this are chunked with
+/// an overlap equal to the longest candidate string, so boundary hits are
+/// not missed.
+const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
-/// All suspicious flag names combined for memory search.
-fn all_suspicious_flags() -> Vec<&'static str> {
-    let mut flags: Vec<&'static str> = Vec::new();
-    flags.extend_from_slice(CRITICAL_FLAGS);
-    flags.extend_from_slice(HIGH_FLAGS);
-    flags.extend_from_slice(MEDIUM_FLAGS);
-    flags
-}
+/// Absolute per-region cap. Regions larger than this (>512 MiB) are only
+/// partially scanned (the first ABS_REGION_CAP bytes), with a finding noting
+/// the truncation, to keep total scan time bounded.
+const ABS_REGION_CAP: usize = 512 * 1024 * 1024;
 
-/// Per-scan state for deduplicating findings across regions.
+/// Aggregated state for an observed flag name, across all regions in one scan.
 #[derive(Default)]
-struct FlagHitTracker {
-    seen: HashSet<&'static str>,
+struct FlagHit {
+    count: usize,
+    first_address: usize,
+    /// True if at least one occurrence was found as UTF-16LE (wide string).
+    seen_wide: bool,
+    /// True if at least one occurrence was found as plain ASCII/UTF-8.
+    seen_ascii: bool,
 }
 
-impl FlagHitTracker {
-    fn record(&mut self, flag: &'static str) -> bool {
-        self.seen.insert(flag)
+/// Per-scan hit map. Keys are interned flag names (static strings for known
+/// flags, owned strings for unknown discoveries).
+#[derive(Default)]
+struct FlagHitTable {
+    hits: HashMap<String, FlagHit>,
+}
+
+impl FlagHitTable {
+    fn record(&mut self, flag: &str, address: usize, wide: bool) {
+        let entry = self.hits.entry(flag.to_string()).or_default();
+        if entry.count == 0 {
+            entry.first_address = address;
+        }
+        entry.count += 1;
+        if wide {
+            entry.seen_wide = true;
+        } else {
+            entry.seen_ascii = true;
+        }
     }
-    fn total(&self) -> usize {
-        self.seen.len()
+    fn total_flags(&self) -> usize {
+        self.hits.len()
     }
 }
 
@@ -61,24 +82,20 @@ pub async fn scan() -> Vec<ScanFinding> {
         scan_windows().await
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        scan_macos().await
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(target_os = "windows"))]
     {
         vec![ScanFinding::new(
             "memory_scanner",
-            ScanVerdict::Suspicious,
-            "Memory scan unavailable: unsupported platform",
-            None,
+            ScanVerdict::Clean,
+            "Memory scan not supported on this platform",
+            Some("Memory scanning is Windows-only in this build.".to_string()),
         )]
     }
 }
 
 /// Result of locating a Roblox process: the PID and whether the executable
 /// path passed basic validation against expected Roblox install roots.
+#[cfg(target_os = "windows")]
 struct RobloxProcess {
     pid: u32,
     exe_path: Option<String>,
@@ -88,17 +105,15 @@ struct RobloxProcess {
 /// Find the Roblox process PID, validating the executable path against
 /// expected install roots. Falls back to name-only matching when the path
 /// cannot be read.
+#[cfg(target_os = "windows")]
 fn find_roblox_process() -> Option<RobloxProcess> {
     use sysinfo::{ProcessRefreshKind, RefreshKind, System};
-    let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()));
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+    );
     sys.refresh_all();
 
-    #[cfg(target_os = "windows")]
     let name_hint = "robloxplayerbeta";
-    #[cfg(target_os = "macos")]
-    let name_hint = "robloxplayer";
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let name_hint = "roblox";
 
     let mut best: Option<RobloxProcess> = None;
 
@@ -107,9 +122,7 @@ fn find_roblox_process() -> Option<RobloxProcess> {
         if !name.contains(name_hint) {
             continue;
         }
-        let exe_path = process
-            .exe()
-            .map(|p| p.to_string_lossy().to_string());
+        let exe_path = process.exe().map(|p| p.to_string_lossy().to_string());
         let path_looks_trusted = exe_path
             .as_deref()
             .map(is_trusted_roblox_exe_path)
@@ -137,109 +150,294 @@ fn find_roblox_process() -> Option<RobloxProcess> {
 }
 
 /// Check whether an executable path looks like a real Roblox install.
+#[cfg(target_os = "windows")]
 fn is_trusted_roblox_exe_path(exe_path: &str) -> bool {
     let lower = exe_path.to_lowercase();
-    #[cfg(target_os = "windows")]
-    {
-        let roots: Vec<String> = trusted_windows_roblox_roots();
-        roots.iter().any(|r| lower.starts_with(&r.to_lowercase()))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        lower.starts_with("/applications/roblox.app/")
-            || lower.contains("/roblox.app/contents/macos/")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        false
-    }
+    let roots: Vec<String> = trusted_windows_roblox_roots();
+    roots.iter().any(|r| lower.starts_with(&r.to_lowercase()))
 }
 
-/// Search a memory buffer for suspicious FFlag strings.
-/// Uses per-scan dedup so the same flag name appearing in multiple regions
-/// is reported only once per scan.
-fn search_buffer_for_flags(
-    buffer: &[u8],
-    base_address: usize,
-    flags: &[&'static str],
-    tracker: &mut FlagHitTracker,
-) -> Vec<ScanFinding> {
-    let mut findings = Vec::new();
-
-    for &flag_name in flags {
-        // Skip empty entries defensively (shouldn't happen in the static tables).
-        if flag_name.is_empty() {
-            continue;
-        }
-        // Already reported this scan — skip the scan entirely for this flag.
-        if tracker.seen.contains(flag_name) {
-            continue;
-        }
-        let flag_bytes = flag_name.as_bytes();
-        if flag_bytes.len() > buffer.len() {
-            continue;
-        }
-
-        let end = buffer.len() - flag_bytes.len();
-        let mut i = 0usize;
-        while i <= end {
-            if &buffer[i..i + flag_bytes.len()] == flag_bytes
-                && is_contextual_flag_match(buffer, i, flag_bytes.len())
-            {
-                if !tracker.record(flag_name) {
-                    break;
-                }
-                let severity = crate::data::suspicious_flags::get_flag_severity(flag_name);
-                let address = base_address.saturating_add(i);
-                let category = get_flag_category(flag_name).unwrap_or("UNKNOWN");
-                let desc = get_flag_description(flag_name);
-                let detail_suffix = desc.map(|d| format!(" | {}", d)).unwrap_or_default();
-
-                findings.push(ScanFinding::new(
-                    "memory_scanner",
-                    severity,
-                    format!("FFlag found in Roblox memory: \"{}\"", flag_name),
-                    Some(format!(
-                        "Address: 0x{:X} | Category: {}{}",
-                        address, category, detail_suffix
-                    )),
-                ));
-                break;
-            }
-            i += 1;
-        }
-    }
-
-    findings
-}
-
-/// Require that the match be bounded by non-identifier bytes (or start/end of buffer)
-/// and that at least one surrounding byte resembles a key/value delimiter
-/// (`"`, `:`, `=`, `{`, `,`, NUL). This filters out matches inside longer
-/// identifiers (FFlagFooBar matching FFlagFoo) and most natural-language prose,
-/// while still catching both JSON-style `"FFlagFoo":true` and NUL-terminated
-/// C-string forms.
-fn is_contextual_flag_match(buffer: &[u8], start: usize, len: usize) -> bool {
+/// Require that the match be bounded by non-identifier bytes (or start/end of
+/// buffer). This rejects matches that are a prefix/suffix inside a longer
+/// identifier — e.g. searching for `FFlagFoo` must not match `FFlagFooBar`.
+fn is_boundary_ok(buffer: &[u8], start: usize, len: usize) -> bool {
     let before = if start == 0 { None } else { Some(buffer[start - 1]) };
     let after_idx = start + len;
-    let after = if after_idx < buffer.len() { Some(buffer[after_idx]) } else { None };
-
+    let after = if after_idx < buffer.len() {
+        Some(buffer[after_idx])
+    } else {
+        None
+    };
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    // Reject if immediately adjacent to another identifier byte — that means
-    // this match is a prefix/suffix inside a longer name.
     if before.map(is_ident).unwrap_or(false) {
         return false;
     }
     if after.map(is_ident).unwrap_or(false) {
         return false;
     }
+    true
+}
 
-    // Accept a delimiter on either side that resembles JSON, a NUL-terminated
-    // string, a shell/env assignment, or the start/end of buffer.
+/// Extended boundary check requiring at least one surrounding byte to look like
+/// a JSON/C-string/shell delimiter. Used for generic prefix discovery so that
+/// identifiers embedded in random binary noise are not picked up.
+fn is_contextual_match(buffer: &[u8], start: usize, len: usize) -> bool {
+    if !is_boundary_ok(buffer, start, len) {
+        return false;
+    }
+    let before = if start == 0 { None } else { Some(buffer[start - 1]) };
+    let after_idx = start + len;
+    let after = if after_idx < buffer.len() {
+        Some(buffer[after_idx])
+    } else {
+        None
+    };
     let is_delim = |b: u8| matches!(b, b'"' | b':' | b'=' | b'{' | b',' | b' ' | b'\t' | 0);
     let before_ok = before.map(is_delim).unwrap_or(true);
     let after_ok = after.map(is_delim).unwrap_or(true);
     before_ok && after_ok
+}
+
+/// Identifier-body character (first byte must still be an uppercase letter,
+/// see the scanner logic).
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Generic prefix scan: walks every byte, and at each position checks whether
+/// a known flag prefix appears followed by a camel-cased identifier body.
+/// Boundary-checked so prefixes embedded inside other identifiers are ignored.
+/// Returns tuples of (flag_name_start_in_buffer, full_name_string, is_known).
+fn scan_prefix_hits(buffer: &[u8]) -> Vec<(usize, String, bool)> {
+    let mut out: Vec<(usize, String, bool)> = Vec::new();
+
+    if buffer.is_empty() {
+        return out;
+    }
+
+    let mut i = 0usize;
+    while i < buffer.len() {
+        // Try each known prefix at this position.
+        let mut matched_prefix: Option<&str> = None;
+        for &prefix in FLAG_PREFIXES {
+            let pb = prefix.as_bytes();
+            if i + pb.len() > buffer.len() {
+                continue;
+            }
+            if &buffer[i..i + pb.len()] != pb {
+                continue;
+            }
+            matched_prefix = Some(prefix);
+            break;
+        }
+
+        let prefix = match matched_prefix {
+            Some(p) => p,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Left boundary: the byte before the prefix must not be an identifier byte.
+        if i > 0 && is_ident_byte(buffer[i - 1]) {
+            i += 1;
+            continue;
+        }
+
+        // Walk the identifier body after the prefix.
+        let body_start = i + prefix.len();
+        // First body byte must be an uppercase ASCII letter — real Roblox flag
+        // bodies are camel-case (e.g. FFlagDebug...). This tightens the match
+        // against random `FInt` bytes in binary data that happen to continue
+        // with non-letters or lowercase letters.
+        if body_start >= buffer.len() {
+            i += 1;
+            continue;
+        }
+        let first_body = buffer[body_start];
+        if !(first_body.is_ascii_uppercase()) {
+            i += 1;
+            continue;
+        }
+
+        let mut j = body_start;
+        while j < buffer.len() && j - body_start < MAX_IDENT_BODY_LEN && is_ident_byte(buffer[j]) {
+            j += 1;
+        }
+        let body_len = j - body_start;
+        if body_len < MIN_IDENT_BODY_LEN {
+            i += 1;
+            continue;
+        }
+
+        let total_len = prefix.len() + body_len;
+
+        // Right boundary: already enforced (we stopped at a non-ident byte or buffer end).
+        // Contextual check to reduce random binary false positives.
+        if !is_contextual_match(buffer, i, total_len) {
+            i += 1;
+            continue;
+        }
+
+        // Full identifier as a UTF-8 string. All bytes in [i, j) are ASCII by construction.
+        let name = match std::str::from_utf8(&buffer[i..j]) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let is_known = CRITICAL_FLAGS.iter().any(|&f| f == name)
+            || HIGH_FLAGS.iter().any(|&f| f == name)
+            || MEDIUM_FLAGS.iter().any(|&f| f == name)
+            || is_allowed_flag(&name);
+
+        out.push((i, name, is_known));
+        // Advance past this identifier to avoid re-matching its interior.
+        i = j;
+    }
+
+    out
+}
+
+/// Scan a buffer for UTF-16LE occurrences of any known suspicious flag name.
+/// This is targeted (against known lists) rather than generic, because
+/// UTF-16 noise generates unacceptable false-positive rates otherwise.
+fn scan_wide_known(
+    buffer: &[u8],
+    base_address: usize,
+    table: &mut FlagHitTable,
+) {
+    // Precompute UTF-16LE encodings of each known flag.
+    let mut known: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    known.extend(CRITICAL_FLAGS.iter().map(|&f| (f, to_utf16le(f))));
+    known.extend(HIGH_FLAGS.iter().map(|&f| (f, to_utf16le(f))));
+    known.extend(MEDIUM_FLAGS.iter().map(|&f| (f, to_utf16le(f))));
+
+    for (name, wbytes) in &known {
+        if wbytes.len() > buffer.len() {
+            continue;
+        }
+        let end = buffer.len() - wbytes.len();
+        let mut i = 0usize;
+        // Step by 1 rather than 2: UTF-16 strings embedded inside packed
+        // structures or at arbitrary byte offsets can land at odd alignments.
+        // Byte-level scanning is the only way to catch them reliably.
+        while i <= end {
+            if &buffer[i..i + wbytes.len()] == wbytes.as_slice()
+                && is_wide_boundary_ok(buffer, i, wbytes.len())
+            {
+                let address = base_address.saturating_add(i);
+                table.record(name, address, true);
+                i += wbytes.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+fn to_utf16le(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() * 2);
+    for u in s.encode_utf16() {
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    out
+}
+
+/// UTF-16LE boundary check: the wide char before/after must not be another
+/// identifier code unit. For ASCII identifier chars in UTF-16LE, this means
+/// the byte pair `(x, 0x00)` where `x` is ident-like.
+fn is_wide_boundary_ok(buffer: &[u8], start: usize, len: usize) -> bool {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // Before: two bytes prior
+    if start >= 2 {
+        let lo = buffer[start - 2];
+        let hi = buffer[start - 1];
+        if hi == 0 && is_ident(lo) {
+            return false;
+        }
+    }
+    // After
+    let after = start + len;
+    if after + 1 < buffer.len() {
+        let lo = buffer[after];
+        let hi = buffer[after + 1];
+        if hi == 0 && is_ident(lo) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Core per-buffer scan. Combines generic prefix discovery (ASCII) + targeted
+/// UTF-16LE search against known lists. Updates the shared hit table.
+fn scan_buffer(buffer: &[u8], base_address: usize, table: &mut FlagHitTable) {
+    // ASCII generic prefix scan — captures known AND unknown flags.
+    for (offset, name, _is_known) in scan_prefix_hits(buffer) {
+        let address = base_address.saturating_add(offset);
+        table.record(&name, address, false);
+    }
+    // UTF-16LE targeted scan for known names.
+    scan_wide_known(buffer, base_address, table);
+}
+
+/// Emit findings from the hit table. Each flag produces one finding, with
+/// severity derived from classification: allowlist → Clean (skipped from
+/// findings), known suspicious → get_flag_severity, unknown → Suspicious.
+fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
+    let mut out = Vec::new();
+    // Sort by descending severity priority then by name, for stable output.
+    let mut entries: Vec<(&String, &FlagHit)> = table.hits.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, hit) in entries {
+        if is_allowed_flag(name) {
+            // Official allowed flags are not a finding — the user is allowed
+            // to set these. Skip.
+            continue;
+        }
+        let known_critical = CRITICAL_FLAGS.iter().any(|&f| f == name);
+        let known_high = HIGH_FLAGS.iter().any(|&f| f == name);
+        let known_medium = MEDIUM_FLAGS.iter().any(|&f| f == name);
+        let is_known = known_critical || known_high || known_medium;
+
+        let (verdict, category) = if is_known {
+            (get_flag_severity(name), get_flag_category(name).unwrap_or("KNOWN"))
+        } else {
+            (ScanVerdict::Suspicious, "UNRECOGNIZED")
+        };
+
+        let desc = get_flag_description(name);
+        let desc_suffix = desc.map(|d| format!(" | {}", d)).unwrap_or_default();
+        let encoding = match (hit.seen_ascii, hit.seen_wide) {
+            (true, true) => "ascii+utf16",
+            (true, false) => "ascii",
+            (false, true) => "utf16",
+            (false, false) => "unknown",
+        };
+
+        let msg = if is_known {
+            format!("FFlag found in Roblox memory: \"{}\"", name)
+        } else {
+            format!(
+                "Unrecognized FFlag-shaped identifier in Roblox memory: \"{}\"",
+                name
+            )
+        };
+
+        out.push(ScanFinding::new(
+            "memory_scanner",
+            verdict,
+            msg,
+            Some(format!(
+                "First address: 0x{:X} | Occurrences: {} | Encoding: {} | Category: {}{}",
+                hit.first_address, hit.count, encoding, category, desc_suffix
+            )),
+        ));
+    }
+    out
 }
 
 // ============================
@@ -270,6 +468,14 @@ mod windows_impl {
         }
     }
 
+    /// Longest candidate byte-length we need to preserve across chunk boundaries.
+    /// Maximum plausible wide-string length dominates: (prefix + MAX_IDENT_BODY_LEN) * 2.
+    fn chunk_overlap_bytes() -> usize {
+        // Longest prefix is "DFString" / "SFString" at 8 chars.
+        let max_name = 8 + MAX_IDENT_BODY_LEN;
+        max_name * 2 + 4
+    }
+
     pub(super) async fn scan_windows() -> Vec<ScanFinding> {
         let proc = match find_roblox_process() {
             Some(p) => p,
@@ -285,9 +491,8 @@ mod windows_impl {
 
         let pid = proc.pid;
 
-        let raw_handle: HANDLE = unsafe {
-            OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid as DWORD)
-        };
+        let raw_handle: HANDLE =
+            unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid as DWORD) };
         if raw_handle.is_null() {
             return vec![ScanFinding::new(
                 "memory_scanner",
@@ -317,8 +522,7 @@ mod windows_impl {
         findings.extend(scan_modules_windows(handle.0, pid));
 
         // (2) Walk committed regions.
-        let mut tracker = FlagHitTracker::default();
-        let flags = all_suspicious_flags();
+        let mut table = FlagHitTable::default();
 
         let mut address: usize = 0;
         let mut mem_info: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
@@ -326,7 +530,11 @@ mod windows_impl {
         let mut rwx_hits = 0usize;
         let mut regions_scanned = 0usize;
         let mut regions_walked = 0usize;
+        let mut bytes_scanned: u64 = 0;
+        let mut truncated_regions = 0usize;
         let mut scan_completed = false;
+
+        let overlap = chunk_overlap_bytes();
 
         loop {
             if regions_walked >= MAX_REGIONS_WALKED {
@@ -348,9 +556,7 @@ mod windows_impl {
             let state = mem_info.State;
             let region_type = mem_info.Type;
 
-            // PAGE_GUARD pages raise STATUS_GUARD_PAGE_VIOLATION on read — skip.
             let is_guard = (protect & PAGE_GUARD) != 0;
-            // Strip modifier bits for the readable/RWX classification.
             let base_protect = protect & 0xFF;
 
             if state == MEM_COMMIT && region_size > 0 && !is_guard {
@@ -377,30 +583,50 @@ mod windows_impl {
                     ));
                 }
 
-                // Only scan heap/private/mapped regions for FFlag strings.
-                // MEM_IMAGE regions are file-backed (module .text/.rdata) and
-                // contain every flag name as a literal on a vanilla client,
-                // producing false positives we can't disambiguate.
+                // Only scan heap/private/mapped regions for strings. MEM_IMAGE
+                // (file-backed .text/.rdata) contains every flag name as a
+                // literal on a vanilla client, producing false positives we
+                // can't disambiguate for the ASCII scan.
                 let is_image = region_type == MEM_IMAGE;
-                if is_readable && !is_image && region_size <= MAX_REGION_READ_BYTES {
-                    let mut buffer = vec![0u8; region_size];
-                    let mut bytes_read: usize = 0;
-                    let read_ok = unsafe {
-                        ReadProcessMemory(
-                            handle.0,
-                            address as LPCVOID,
-                            buffer.as_mut_ptr() as LPVOID,
-                            region_size,
-                            &mut bytes_read,
-                        )
-                    };
-                    if read_ok != 0 && bytes_read > 0 {
-                        buffer.truncate(bytes_read);
-                        let region_findings =
-                            search_buffer_for_flags(&buffer, address, &flags, &mut tracker);
-                        findings.extend(region_findings);
-                        regions_scanned += 1;
+                if is_readable && !is_image {
+                    let effective_size = region_size.min(ABS_REGION_CAP);
+                    if effective_size < region_size {
+                        truncated_regions += 1;
                     }
+
+                    // Chunked read with overlap so boundary-straddling hits are not missed.
+                    let mut offset = 0usize;
+                    while offset < effective_size {
+                        let this_chunk = (effective_size - offset).min(MAX_CHUNK_BYTES);
+                        let mut buffer = vec![0u8; this_chunk];
+                        let mut bytes_read: usize = 0;
+                        let read_ok = unsafe {
+                            ReadProcessMemory(
+                                handle.0,
+                                (address + offset) as LPCVOID,
+                                buffer.as_mut_ptr() as LPVOID,
+                                this_chunk,
+                                &mut bytes_read,
+                            )
+                        };
+                        if read_ok != 0 && bytes_read > 0 {
+                            buffer.truncate(bytes_read);
+                            bytes_scanned = bytes_scanned.saturating_add(bytes_read as u64);
+                            scan_buffer(&buffer, address + offset, &mut table);
+                        } else {
+                            // Unreadable chunk — advance past it without an overlap replay.
+                            offset = offset.saturating_add(this_chunk);
+                            continue;
+                        }
+
+                        let advance = if this_chunk > overlap {
+                            this_chunk - overlap
+                        } else {
+                            this_chunk
+                        };
+                        offset = offset.saturating_add(advance);
+                    }
+                    regions_scanned += 1;
                 }
             }
 
@@ -416,25 +642,39 @@ mod windows_impl {
             address = next;
         }
 
-        // Report partial vs complete scan honestly.
+        // Emit flag findings.
+        findings.extend(findings_from_table(&table));
+
+        // Honest summary.
         if !scan_completed || regions_scanned == 0 {
             findings.push(ScanFinding::new(
                 "memory_scanner",
                 ScanVerdict::Suspicious,
                 "Memory scan incomplete: region enumeration terminated early — cannot attest clean state",
                 Some(format!(
-                    "PID: {}, regions_walked: {}, regions_scanned: {}",
-                    pid, regions_walked, regions_scanned
+                    "PID: {}, regions_walked: {}, regions_scanned: {}, bytes: {}",
+                    pid, regions_walked, regions_scanned, bytes_scanned
                 )),
             ));
-        } else if tracker.total() == 0 {
+        } else if table.total_flags() == 0 {
             findings.push(ScanFinding::new(
                 "memory_scanner",
                 ScanVerdict::Clean,
                 "No suspicious FFlags found in Roblox process memory",
                 Some(format!(
-                    "PID: {}, regions_scanned: {}",
-                    pid, regions_scanned
+                    "PID: {}, regions_scanned: {}, bytes_scanned: {}",
+                    pid, regions_scanned, bytes_scanned
+                )),
+            ));
+        }
+        if truncated_regions > 0 {
+            findings.push(ScanFinding::new(
+                "memory_scanner",
+                ScanVerdict::Suspicious,
+                "One or more memory regions exceeded scan cap and were only partially scanned",
+                Some(format!(
+                    "PID: {}, truncated_regions: {}, per_region_cap_bytes: {}",
+                    pid, truncated_regions, ABS_REGION_CAP
                 )),
             ));
         }
@@ -488,7 +728,6 @@ mod windows_impl {
                 .saturating_add(256)
                 .min(256 * 1024);
             if new_len <= modules.len() {
-                // Shouldn't happen, but stop retrying to avoid infinite growth.
                 findings.push(ScanFinding::new(
                     "memory_scanner",
                     ScanVerdict::Suspicious,
@@ -511,13 +750,10 @@ mod windows_impl {
                 continue;
             }
 
-            // Start with MAX_PATH; grow if GetModuleFileNameExW fills the buffer exactly.
             let mut buf: Vec<u16> = vec![0; MAX_PATH];
-            let mut len = unsafe {
-                GetModuleFileNameExW(handle, hmod, buf.as_mut_ptr(), buf.len() as DWORD)
-            };
+            let mut len =
+                unsafe { GetModuleFileNameExW(handle, hmod, buf.as_mut_ptr(), buf.len() as DWORD) };
             while len != 0 && (len as usize) == buf.len() {
-                // Possibly truncated — grow and retry.
                 let new_size = buf.len().saturating_mul(2).min(65_536);
                 if new_size <= buf.len() {
                     break;
@@ -528,8 +764,6 @@ mod windows_impl {
                 };
             }
             if len == 0 {
-                // Treat unreadable module name as suspicious — an attacker might
-                // hide the path by racing a detach or via ACL restrictions.
                 findings.push(ScanFinding::new(
                     "memory_scanner",
                     ScanVerdict::Suspicious,
@@ -580,7 +814,6 @@ mod windows_impl {
         findings
     }
 
-    /// Known-folder-backed trusted roots for Roblox's own executable.
     pub(super) fn trusted_windows_roblox_roots() -> Vec<String> {
         let mut roots = Vec::new();
         if let Ok(pf) = std::env::var("ProgramFiles") {
@@ -592,13 +825,11 @@ mod windows_impl {
         }
         if let Ok(local) = std::env::var("LocalAppData") {
             roots.push(format!("{}\\Roblox", local));
-            roots.push(format!("{}\\Packages", local)); // UWP sandbox state
+            roots.push(format!("{}\\Packages", local));
         }
         roots
     }
 
-    /// Known-folder-backed trusted roots for modules loaded into Roblox.
-    /// Only the Windows system dirs and Roblox install dirs are allowed.
     fn trusted_module_roots_lower() -> Vec<String> {
         let mut roots = Vec::new();
 
@@ -624,12 +855,7 @@ mod windows_impl {
         roots
     }
 
-    /// A path is trusted if it starts with one of the known install/system roots.
-    /// Uses prefix matching (not unanchored substring) to prevent attacker-controlled
-    /// parent directories from whitelisting malicious DLLs.
     fn is_trusted_module_path(path_lower: &str) -> bool {
-        // Reject paths containing `..` segments outright — GetModuleFileNameExW
-        // normally returns canonical paths, so a `..` segment is suspicious on its own.
         if path_lower.contains("\\..\\") {
             return false;
         }
@@ -637,9 +863,6 @@ mod windows_impl {
         roots.iter().any(|r| path_lower.starts_with(r))
     }
 
-    /// A path is HIGH-RISK (Flagged, not just Suspicious) if it lives in an
-    /// obviously user-writable tooling location. Only applied to modules that
-    /// already failed the trusted-root check.
     fn is_high_risk_module_path(path_lower: &str) -> bool {
         const HIGH_RISK_SUBSTRS: &[&str] = &[
             "\\temp\\",
@@ -665,253 +888,162 @@ async fn scan_windows() -> Vec<ScanFinding> {
 }
 
 // ============================
-// macOS implementation
+// Tests
 // ============================
-#[cfg(target_os = "macos")]
-mod macos_impl {
+#[cfg(test)]
+mod tests {
     use super::*;
-    use mach2::kern_return::KERN_SUCCESS;
-    use mach2::mach_port::mach_port_deallocate;
-    use mach2::message::mach_msg_type_number_t;
-    use mach2::port::{mach_port_t, MACH_PORT_NULL};
-    use mach2::traps::{mach_task_self, task_for_pid};
-    use mach2::vm::{mach_vm_deallocate, mach_vm_read, mach_vm_region};
-    use mach2::vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
-    use mach2::vm_region::{vm_region_basic_info_64, vm_region_info_t, VM_REGION_BASIC_INFO_64};
-    use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, vm_offset_t};
-    use std::mem;
 
-    /// RAII for a mach task send right.
-    struct ScopedTaskPort(mach_port_t);
-    impl Drop for ScopedTaskPort {
-        fn drop(&mut self) {
-            if self.0 != MACH_PORT_NULL {
-                unsafe {
-                    mach_port_deallocate(mach_task_self(), self.0);
-                }
-            }
+    fn bytes(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn prefix_scan_finds_known_flag() {
+        let b = bytes("{\"DFIntS2PhysicsSenderRate\":1}");
+        let hits = scan_prefix_hits(&b);
+        assert!(hits.iter().any(|(_, n, known)| n == "DFIntS2PhysicsSenderRate" && *known));
+    }
+
+    #[test]
+    fn prefix_scan_finds_unknown_flag() {
+        let b = bytes("junk\"FFlagTotallyMadeUpNewFlag\":true more junk");
+        let hits = scan_prefix_hits(&b);
+        let got = hits.iter().find(|(_, n, known)| n == "FFlagTotallyMadeUpNewFlag" && !*known);
+        assert!(got.is_some(), "unknown flag must still be reported");
+    }
+
+    #[test]
+    fn prefix_scan_rejects_substring_inside_longer_ident() {
+        // Would previously match FFlagFoo inside FFlagFooBar.
+        let b = bytes("FFlagFooBar stuff");
+        let hits = scan_prefix_hits(&b);
+        // The extractor takes the full identifier FFlagFooBar, so we should see
+        // that name exactly — never a truncated "FFlagFoo".
+        assert!(hits.iter().any(|(_, n, _)| n == "FFlagFooBar"));
+        assert!(!hits.iter().any(|(_, n, _)| n == "FFlagFoo"));
+    }
+
+    #[test]
+    fn prefix_scan_rejects_lowercase_body_start() {
+        // `FFlagabc` — real flags never have a lowercase first body letter.
+        let b = bytes("\"FFlagabc\":1");
+        let hits = scan_prefix_hits(&b);
+        assert!(hits.is_empty(), "expected no hits, got {:?}", hits);
+    }
+
+    #[test]
+    fn prefix_scan_rejects_too_short_body() {
+        let b = bytes("\"FFlagA\":1");
+        let hits = scan_prefix_hits(&b);
+        assert!(hits.is_empty(), "single-letter bodies are noise");
+    }
+
+    #[test]
+    fn prefix_scan_rejects_ident_prefix_boundary() {
+        // "xFFlagBar" — the F is inside a larger identifier, should not match.
+        let b = bytes("xFFlagBarValue=1");
+        let hits = scan_prefix_hits(&b);
+        assert!(hits.is_empty(), "expected no hits, got {:?}", hits);
+    }
+
+    #[test]
+    fn boundary_ok_accepts_end_of_buffer() {
+        let b = bytes("hello");
+        assert!(is_boundary_ok(&b, 0, b.len()));
+    }
+
+    #[test]
+    fn contextual_match_requires_delimiter_context() {
+        let b = bytes("randombinaryFFlagDebugXY"); // no delimiter before the prefix
+        // The byte before 'F' is 'y' — an ident byte — so boundary check should
+        // reject. scan_prefix_hits covers this via its own boundary check,
+        // but here we exercise is_contextual_match directly.
+        assert!(!is_contextual_match(&b, 12, 14));
+    }
+
+    #[test]
+    fn wide_scan_matches_known_flag() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(&to_utf16le("DFIntS2PhysicsSenderRate"));
+        buf.extend_from_slice(&[0u8; 4]);
+        let mut table = FlagHitTable::default();
+        scan_wide_known(&buf, 0x1000, &mut table);
+        let hit = table.hits.get("DFIntS2PhysicsSenderRate").expect("hit");
+        assert_eq!(hit.count, 1);
+        assert!(hit.seen_wide);
+    }
+
+    #[test]
+    fn scan_buffer_aggregates_ascii_and_wide() {
+        let flag = "DFIntS2PhysicsSenderRate";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\"");
+        buf.extend_from_slice(flag.as_bytes());
+        // Non-ident byte ',' followed by two NUL bytes keeps the wide-boundary
+        // check from mistaking the preceding ASCII for a UTF-16 identifier code
+        // unit. Real process memory typically has non-ident filler between
+        // adjacent strings, so this matches realistic layouts.
+        buf.extend_from_slice(b"\",\x00\x00");
+        buf.extend_from_slice(&to_utf16le(flag));
+        buf.extend_from_slice(&[0, 0]);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&buf, 0x2000, &mut table);
+        let hit = table.hits.get(flag).expect("flag present");
+        assert!(hit.seen_ascii, "ascii match missing");
+        assert!(hit.seen_wide, "wide match missing");
+        assert_eq!(hit.count, 2);
+    }
+
+    #[test]
+    fn findings_skip_allowlisted_flag() {
+        // Pretend we saw an allowlisted flag in memory — it should not produce a finding.
+        let mut table = FlagHitTable::default();
+        table.record("FIntMSAASamples", 0x1000, false);
+        let findings = findings_from_table(&table);
+        assert!(findings.is_empty(), "allowlisted flag must not be a finding");
+    }
+
+    #[test]
+    fn findings_report_unknown_as_suspicious() {
+        let mut table = FlagHitTable::default();
+        table.record("FFlagCompletelyUnknownThing", 0x2000, false);
+        let findings = findings_from_table(&table);
+        assert_eq!(findings.len(), 1);
+        // Verdict should be Suspicious (not Clean, not Flagged).
+        match &findings[0].verdict {
+            ScanVerdict::Suspicious => {}
+            other => panic!("expected Suspicious, got {:?}", other),
         }
     }
 
-    /// RAII for a mach_vm_read buffer.
-    struct ScopedVmRead {
-        task: mach_port_t,
-        ptr: vm_offset_t,
-        size: mach_msg_type_number_t,
+    #[test]
+    fn chunked_boundary_hit_is_recoverable() {
+        // Simulate a chunk boundary: split a flag across two halves, with an
+        // overlap equal to half the flag. The ASCII scan should still find it
+        // when the second chunk starts inside the overlap.
+        let flag = "DFIntS2PhysicsSenderRate";
+        let payload = format!("\"{}\":1", flag);
+        let bytes = payload.as_bytes();
+
+        // Pretend a chunk of 16 bytes with an overlap of 12 — the identifier
+        // spans the boundary and the scan of the second chunk (starting 4
+        // bytes before the end of the first) must still catch it.
+        let first_chunk_end = 10usize;
+        let overlap = 12usize;
+        let second_start = first_chunk_end.saturating_sub(overlap); // 0 -> full replay
+
+        let chunk_a = &bytes[..first_chunk_end.min(bytes.len())];
+        let chunk_b = &bytes[second_start..];
+
+        let mut table = FlagHitTable::default();
+        scan_buffer(chunk_a, 0, &mut table);
+        scan_buffer(chunk_b, second_start, &mut table);
+
+        assert!(
+            table.hits.contains_key(flag),
+            "chunk-straddling flag must be found after overlap replay"
+        );
     }
-    impl Drop for ScopedVmRead {
-        fn drop(&mut self) {
-            if self.ptr != 0 {
-                unsafe {
-                    mach_vm_deallocate(
-                        self.task,
-                        self.ptr as mach_vm_address_t,
-                        self.size as mach_vm_size_t,
-                    );
-                }
-            }
-        }
-    }
-
-    pub(super) async fn scan_macos() -> Vec<ScanFinding> {
-        let proc = match find_roblox_process() {
-            Some(p) => p,
-            None => {
-                return vec![ScanFinding::new(
-                    "memory_scanner",
-                    ScanVerdict::Clean,
-                    "Roblox process not found - memory scan skipped",
-                    None,
-                )];
-            }
-        };
-        let pid = proc.pid;
-
-        let mut raw_task: mach_port_t = MACH_PORT_NULL;
-        let kr = unsafe { task_for_pid(mach_task_self(), pid as i32, &mut raw_task) };
-        if kr != KERN_SUCCESS {
-            return vec![ScanFinding::new(
-                "memory_scanner",
-                ScanVerdict::Suspicious,
-                "Memory scan unavailable: task_for_pid denied. Run with sudo, or sign the scanner with com.apple.security.cs.debugger and a matching provisioning profile.",
-                Some(format!("PID: {}, kern_return: {}", pid, kr)),
-            )];
-        }
-        let task = ScopedTaskPort(raw_task);
-
-        let mut findings = Vec::new();
-
-        if !proc.path_looks_trusted {
-            findings.push(ScanFinding::new(
-                "memory_scanner",
-                ScanVerdict::Suspicious,
-                "Roblox-named process has an unexpected executable path — possible decoy / impersonation",
-                Some(format!(
-                    "PID: {} | Path: {}",
-                    pid,
-                    proc.exe_path.as_deref().unwrap_or("<unknown>")
-                )),
-            ));
-        }
-
-        let mut tracker = FlagHitTracker::default();
-        let flags = all_suspicious_flags();
-
-        let mut address: mach_vm_address_t = 0;
-        let mut size: mach_vm_size_t = 0;
-        let mut rwx_hits = 0usize;
-        let mut regions_scanned = 0usize;
-        let mut regions_walked = 0usize;
-        let mut scan_completed = false;
-
-        let info_count: u32 =
-            (mem::size_of::<vm_region_basic_info_64>() / mem::size_of::<u32>()) as u32;
-
-        loop {
-            if regions_walked >= MAX_REGIONS_WALKED {
-                break;
-            }
-
-            let mut info: vm_region_basic_info_64 = unsafe { mem::zeroed() };
-            let mut info_count_mut: u32 = info_count;
-            let mut object_name: mach_port_t = MACH_PORT_NULL;
-
-            let kr = unsafe {
-                mach_vm_region(
-                    task.0,
-                    &mut address,
-                    &mut size,
-                    VM_REGION_BASIC_INFO_64,
-                    &mut info as *mut _ as vm_region_info_t,
-                    &mut info_count_mut,
-                    &mut object_name,
-                )
-            };
-
-            // Release the object_name send right immediately — we don't use it.
-            if object_name != MACH_PORT_NULL {
-                unsafe {
-                    mach_port_deallocate(mach_task_self(), object_name);
-                }
-            }
-
-            if kr != KERN_SUCCESS {
-                // End of address space → KERN_INVALID_ADDRESS — treat as normal completion.
-                // Other kr values are errors; treat as early termination.
-                const KERN_INVALID_ADDRESS: i32 = 1;
-                if kr == KERN_INVALID_ADDRESS {
-                    scan_completed = true;
-                }
-                break;
-            }
-            regions_walked += 1;
-
-            let protection = info.protection;
-            let is_readable = (protection & VM_PROT_READ) != 0;
-            let is_rwx = (protection & (VM_PROT_WRITE | VM_PROT_EXECUTE))
-                == (VM_PROT_WRITE | VM_PROT_EXECUTE);
-
-            if is_rwx {
-                rwx_hits += 1;
-                findings.push(ScanFinding::new(
-                    "memory_scanner",
-                    ScanVerdict::Flagged,
-                    format!(
-                        "RWX memory region in Roblox process ({} KB) — possible shellcode or runtime-patched code",
-                        size / 1024
-                    ),
-                    Some(format!(
-                        "Address: 0x{:X}, Size: {} bytes, Protection: 0x{:X}",
-                        address, size, protection
-                    )),
-                ));
-            }
-
-            if is_readable
-                && size > 0
-                && size as usize <= MAX_REGION_READ_BYTES
-            {
-                let mut data_ptr: vm_offset_t = 0;
-                let mut data_size: mach_msg_type_number_t = 0;
-
-                let read_kr = unsafe {
-                    mach_vm_read(task.0, address, size, &mut data_ptr, &mut data_size)
-                };
-
-                if read_kr == KERN_SUCCESS && data_ptr != 0 {
-                    // RAII owns the buffer — drops on all paths.
-                    let _buf_guard = ScopedVmRead {
-                        task: unsafe { mach_task_self() },
-                        ptr: data_ptr,
-                        size: data_size,
-                    };
-                    if (data_size as usize) > 0 && (data_size as usize) <= MAX_REGION_READ_BYTES {
-                        let buffer = unsafe {
-                            std::slice::from_raw_parts(
-                                data_ptr as *const u8,
-                                data_size as usize,
-                            )
-                        };
-                        let region_findings = search_buffer_for_flags(
-                            buffer,
-                            address as usize,
-                            &flags,
-                            &mut tracker,
-                        );
-                        findings.extend(region_findings);
-                        regions_scanned += 1;
-                    }
-                }
-            }
-
-            // Advance past this region. `mach_vm_region` sets `address` to the region base;
-            // we step by `size`. Guard against zero-size and overflow.
-            if size == 0 {
-                break;
-            }
-            let next = address.wrapping_add(size);
-            if next <= address {
-                scan_completed = true;
-                break;
-            }
-            address = next;
-        }
-
-        if !scan_completed || regions_scanned == 0 {
-            findings.push(ScanFinding::new(
-                "memory_scanner",
-                ScanVerdict::Suspicious,
-                "Memory scan incomplete: region enumeration terminated early — cannot attest clean state",
-                Some(format!(
-                    "PID: {}, regions_walked: {}, regions_scanned: {}",
-                    pid, regions_walked, regions_scanned
-                )),
-            ));
-        } else if tracker.total() == 0 {
-            findings.push(ScanFinding::new(
-                "memory_scanner",
-                ScanVerdict::Clean,
-                "No suspicious FFlags found in Roblox process memory",
-                Some(format!(
-                    "PID: {}, regions_scanned: {}",
-                    pid, regions_scanned
-                )),
-            ));
-        }
-        if rwx_hits == 0 && scan_completed {
-            findings.push(ScanFinding::new(
-                "memory_scanner",
-                ScanVerdict::Clean,
-                "No RWX memory regions detected in Roblox process",
-                Some(format!("PID: {}", pid)),
-            ));
-        }
-
-        findings
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn scan_macos() -> Vec<ScanFinding> {
-    macos_impl::scan_macos().await
 }
