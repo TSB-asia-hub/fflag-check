@@ -1,5 +1,6 @@
 import { Component, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ScanFinding, ScanReport, ScanVerdict } from "./types";
 
 // Version is wired in at build time from package.json by Vite's __APP_VERSION__
@@ -11,13 +12,46 @@ const APP_VERSION =
 type Phase = "idle" | "scanning" | "complete";
 type Filter = "all" | "flagged" | "suspicious" | "clean";
 
-const SCANNERS = [
-  "processes",
-  "file system",
-  "client settings",
-  "prefetch cache",
-  "memory regions",
+// Display metadata for each scanner. The `id` is the stable identifier the
+// backend uses in `scan-progress` events — keep in sync with SCANNER_IDS
+// in src-tauri/src/scanners/mod.rs.
+const SCANNERS: { id: string; label: string }[] = [
+  { id: "process_scanner", label: "processes" },
+  { id: "file_scanner", label: "file system" },
+  { id: "client_settings_scanner", label: "client settings" },
+  { id: "prefetch_scanner", label: "prefetch cache" },
+  { id: "memory_scanner", label: "memory regions" },
 ];
+
+type ScannerState = "pending" | "running" | "done" | "errored";
+
+type ScannerProgress = {
+  state: ScannerState;
+  findings?: number;
+  // memory_scanner only: bytes scanned so far during the walk
+  bytesScanned?: number;
+  regionsScanned?: number;
+  errorMessage?: string;
+};
+
+type ProgressMap = Record<string, ScannerProgress>;
+
+type ScanProgressEvent =
+  | { kind: "started"; scanner: string }
+  | { kind: "done"; scanner: string; findings: number }
+  | {
+      kind: "heartbeat";
+      scanner: string;
+      regions_scanned: number;
+      bytes_scanned: number;
+    }
+  | { kind: "errored"; scanner: string; message: string };
+
+function emptyProgress(): ProgressMap {
+  return Object.fromEntries(
+    SCANNERS.map((s) => [s.id, { state: "pending" as const }]),
+  );
+}
 
 type Toast = { msg: string; kind: "info" | "success" | "error" };
 
@@ -45,7 +79,7 @@ function findingKey(f: ScanFinding): string {
 function AppInner() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [report, setReport] = useState<ScanReport | null>(null);
-  const [activeScanner, setActiveScanner] = useState(0);
+  const [progress, setProgress] = useState<ProgressMap>(() => emptyProgress());
   const [filter, setFilter] = useState<Filter>("all");
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -61,12 +95,63 @@ function AppInner() {
     if (hasTauriRuntime()) setTauriReady(true);
   }, [tauriReady]);
 
+  // Subscribe to scan-progress events while a scan is running. Each event
+  // mutates the per-scanner state map. Unsubscribe when the phase leaves
+  // "scanning" so stale events from a previous scan can't bleed into a new
+  // one.
   useEffect(() => {
     if (phase !== "scanning") return;
-    const id = window.setInterval(() => {
-      setActiveScanner((i) => (i + 1) % SCANNERS.length);
-    }, 520);
-    return () => window.clearInterval(id);
+    if (!hasTauriRuntime()) return;
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    listen<ScanProgressEvent>("scan-progress", (event) => {
+      const payload = event.payload;
+      setProgress((prev) => {
+        const current = prev[payload.scanner] ?? { state: "pending" };
+        switch (payload.kind) {
+          case "started":
+            return { ...prev, [payload.scanner]: { ...current, state: "running" } };
+          case "done":
+            return {
+              ...prev,
+              [payload.scanner]: {
+                ...current,
+                state: "done",
+                findings: payload.findings,
+              },
+            };
+          case "heartbeat":
+            return {
+              ...prev,
+              [payload.scanner]: {
+                ...current,
+                state: "running",
+                regionsScanned: payload.regions_scanned,
+                bytesScanned: payload.bytes_scanned,
+              },
+            };
+          case "errored":
+            return {
+              ...prev,
+              [payload.scanner]: {
+                ...current,
+                state: "errored",
+                errorMessage: payload.message,
+              },
+            };
+        }
+      });
+    }).then((fn) => {
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
   }, [phase]);
 
   useEffect(() => {
@@ -95,7 +180,7 @@ function AppInner() {
     setReport(null);
     setOpenKey(null);
     setFilter("all");
-    setActiveScanner(0);
+    setProgress(emptyProgress());
     try {
       const result = await invoke<ScanReport>("run_scan");
       setReport(result);
@@ -177,7 +262,7 @@ function AppInner() {
         phase={phase}
         report={report}
         counts={counts}
-        scannerName={SCANNERS[activeScanner]}
+        progress={progress}
       />
       <Workarea
         phase={phase}
@@ -279,17 +364,27 @@ function Toolbar({
 
 /* ——————————————————————————————————————————————————————————— */
 
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KiB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
 function Summary({
   phase,
   report,
   counts,
-  scannerName,
+  progress,
 }: {
   phase: Phase;
   report: ScanReport | null;
   counts: { clean: number; suspicious: number; flagged: number; total: number };
-  scannerName: string;
+  progress: ProgressMap;
 }) {
+  const completedCount = SCANNERS.filter(
+    (s) => progress[s.id]?.state === "done" || progress[s.id]?.state === "errored",
+  ).length;
   const modifier =
     phase === "scanning"
       ? "summary--scanning"
@@ -325,11 +420,54 @@ function Summary({
         {phase === "scanning" ? (
           <div className="summary__progress">
             <div className="summary__bar">
-              <div className="summary__bar-fill" />
+              <div
+                className="summary__bar-fill"
+                style={{
+                  width: `${Math.min(100, (completedCount / SCANNERS.length) * 100)}%`,
+                }}
+              />
             </div>
-            <div className="summary__module">
-              <span className="summary__module-active">{scannerName}</span>
-            </div>
+            <ul className="summary__scanners">
+              {SCANNERS.map((s) => {
+                const p = progress[s.id];
+                const state = p?.state ?? "pending";
+                const mem =
+                  s.id === "memory_scanner" && state === "running" && p?.bytesScanned
+                    ? ` ${formatBytes(p.bytesScanned)} / ${p.regionsScanned ?? 0} regions`
+                    : "";
+                const count =
+                  state === "done" && typeof p?.findings === "number"
+                    ? ` ${p.findings}`
+                    : "";
+                return (
+                  <li
+                    key={s.id}
+                    className={`summary__scanner summary__scanner--${state}`}
+                    title={p?.errorMessage ?? ""}
+                  >
+                    <span className="summary__scanner-mark" aria-hidden>
+                      {state === "done"
+                        ? "✓"
+                        : state === "errored"
+                          ? "✕"
+                          : state === "running"
+                            ? "·"
+                            : " "}
+                    </span>
+                    <span className="summary__scanner-label">{s.label}</span>
+                    <span className="summary__scanner-meta">
+                      {state === "done"
+                        ? count
+                        : state === "running"
+                          ? mem || "…"
+                          : state === "errored"
+                            ? "error"
+                            : ""}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
           </div>
         ) : (
           <div className="summary__counts">

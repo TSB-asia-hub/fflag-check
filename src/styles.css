@@ -337,26 +337,60 @@ button {
 
 .summary__bar-fill {
   position: absolute;
-  inset: 0;
+  inset: 0 auto 0 0;
+  width: 0;
   background: var(--warn);
-  animation: sweep 1.4s var(--ease) infinite;
+  transition: width 320ms var(--ease);
 }
 
-@keyframes sweep {
-  from { transform: translateX(-100%); }
-  to { transform: translateX(100%); }
-}
-
-.summary__module {
+.summary__scanners {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   font-family: var(--font-mono);
   font-size: 12px;
+}
+
+.summary__scanner {
+  display: grid;
+  grid-template-columns: 12px 1fr auto;
+  gap: 8px;
+  align-items: baseline;
   color: var(--text-dim);
 }
 
-.summary__module-active {
-  color: var(--text);
+.summary__scanner-mark {
+  font-family: var(--font-mono);
+  width: 12px;
+  text-align: center;
+}
+
+.summary__scanner-label {
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.summary__scanner-meta {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.summary__scanner--pending { opacity: 0.45; }
+.summary__scanner--running { color: var(--text); }
+.summary__scanner--running .summary__scanner-mark {
+  color: var(--warn);
+  animation: blink 1.1s var(--ease) infinite;
+}
+.summary__scanner--done .summary__scanner-mark { color: var(--clean); }
+.summary__scanner--errored .summary__scanner-mark { color: var(--danger); }
+.summary__scanner--errored { color: var(--danger); }
+
+@keyframes blink {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
 }
 
 /* ——————————————————————————————————————————————————————————————

@@ -8,6 +8,7 @@ use crate::data::suspicious_flags::{
     MEDIUM_FLAGS,
 };
 use crate::models::{ScanFinding, ScanVerdict};
+use crate::scanners::progress::ScanProgress;
 use std::collections::HashMap;
 
 /// Known FFlag prefixes. Any identifier matching `<prefix><IdentBody>` where
@@ -28,6 +29,13 @@ const MIN_IDENT_BODY_LEN: usize = 3;
 /// Hard cap on regions walked per scan, to prevent runaway loops when the OS
 /// enumeration API misbehaves. Roblox typically has far fewer regions.
 const MAX_REGIONS_WALKED: usize = 200_000;
+
+/// Wall-clock safety cap for the entire memory scan. Without this, a stuck
+/// `ReadProcessMemory` on a pathological region (rare, but observed in
+/// field reports) can hang the UI indefinitely with no recovery path. On
+/// expiry the scan returns a Suspicious "aborted" finding so the user
+/// learns coverage was incomplete rather than seeing an infinite spinner.
+const MAX_SCAN_DURATION: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Max per-chunk read (16 MiB). Regions larger than this are chunked with
 /// an overlap equal to the longest candidate string, so boundary hits are
@@ -77,13 +85,20 @@ impl FlagHitTable {
 
 /// Scan Roblox process memory for runtime FFlag injections.
 pub async fn scan() -> Vec<ScanFinding> {
+    scan_with_progress(ScanProgress::noop()).await
+}
+
+/// Same as [`scan`] but accepts a progress reporter so the frontend can show
+/// live region/byte counters while the Windows memory walk is in flight.
+pub async fn scan_with_progress(reporter: ScanProgress) -> Vec<ScanFinding> {
     #[cfg(target_os = "windows")]
     {
-        scan_windows().await
+        scan_windows(reporter).await
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = reporter; // unused on non-Windows
         vec![ScanFinding::new(
             "memory_scanner",
             ScanVerdict::Clean,
@@ -511,7 +526,7 @@ mod windows_impl {
         max_name * 2 + 4
     }
 
-    pub(super) async fn scan_windows() -> Vec<ScanFinding> {
+    pub(super) async fn scan_windows(reporter: ScanProgress) -> Vec<ScanFinding> {
         let proc = match find_roblox_process() {
             Some(p) => p,
             None => {
@@ -578,9 +593,28 @@ mod windows_impl {
         // allocated up to 16 MiB per iteration in the hot loop.
         let mut scratch: Vec<u8> = Vec::with_capacity(MAX_CHUNK_BYTES);
 
+        // Heartbeat pacing: emit a progress event at most every ~400ms so the
+        // UI can show live counters without us flooding the IPC bridge.
+        let heartbeat_interval = std::time::Duration::from_millis(400);
+        let mut last_heartbeat = std::time::Instant::now();
+
+        // Wall-clock safety cap — see MAX_SCAN_DURATION docstring.
+        let scan_started = std::time::Instant::now();
+        let mut timed_out = false;
+
         loop {
             if regions_walked >= MAX_REGIONS_WALKED {
                 break;
+            }
+
+            if scan_started.elapsed() >= MAX_SCAN_DURATION {
+                timed_out = true;
+                break;
+            }
+
+            if last_heartbeat.elapsed() >= heartbeat_interval {
+                reporter.heartbeat("memory_scanner", regions_scanned, bytes_scanned);
+                last_heartbeat = std::time::Instant::now();
             }
 
             let result = unsafe {
@@ -689,7 +723,20 @@ mod windows_impl {
         findings.extend(findings_from_table(&table));
 
         // Honest summary.
-        if !scan_completed || regions_scanned == 0 {
+        if timed_out {
+            findings.push(ScanFinding::new(
+                "memory_scanner",
+                ScanVerdict::Suspicious,
+                format!(
+                    "Memory scan aborted after {}s wall-clock cap — cannot attest clean state",
+                    MAX_SCAN_DURATION.as_secs()
+                ),
+                Some(format!(
+                    "PID: {}, regions_walked: {}, regions_scanned: {}, bytes_scanned: {}",
+                    pid, regions_walked, regions_scanned, bytes_scanned
+                )),
+            ));
+        } else if !scan_completed || regions_scanned == 0 {
             findings.push(ScanFinding::new(
                 "memory_scanner",
                 ScanVerdict::Suspicious,
@@ -945,8 +992,8 @@ fn trusted_windows_roblox_roots() -> Vec<String> {
 }
 
 #[cfg(target_os = "windows")]
-async fn scan_windows() -> Vec<ScanFinding> {
-    windows_impl::scan_windows().await
+async fn scan_windows(reporter: ScanProgress) -> Vec<ScanFinding> {
+    windows_impl::scan_windows(reporter).await
 }
 
 // ============================

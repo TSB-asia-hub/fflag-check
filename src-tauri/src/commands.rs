@@ -1,14 +1,17 @@
 use crate::models::ScanReport;
 use crate::reports::report_generator;
 use crate::scanners;
+use crate::scanners::progress::ScanProgress;
 
 /// Run all scanners and generate a signed scan report. The signed report is
 /// returned to the frontend for display only — when the user exports, the
 /// backend re-runs scanners rather than trusting the frontend copy (see
-/// `save_report`).
+/// `save_report`). Progress events fire on the `scan-progress` topic so the
+/// frontend can show per-scanner state live instead of a fake carousel.
 #[tauri::command]
-pub async fn run_scan() -> Result<ScanReport, String> {
-    let findings = scanners::run_all_scans().await;
+pub async fn run_scan(app: tauri::AppHandle) -> Result<ScanReport, String> {
+    let reporter = ScanProgress::new(app);
+    let findings = scanners::run_all_scans_with_progress(reporter).await;
     let report = report_generator::generate_report(findings);
     Ok(report)
 }
