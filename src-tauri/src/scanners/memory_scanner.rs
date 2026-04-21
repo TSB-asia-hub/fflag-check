@@ -2,7 +2,7 @@
 // exercised by the Windows path or the unit tests. Silence dead_code there.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-use crate::data::flag_allowlist::is_allowed_flag;
+use crate::data::flag_allowlist::{is_allowed_flag, is_memory_baseline_flag};
 use crate::data::suspicious_flags::{
     get_flag_category, get_flag_description, get_flag_severity, CRITICAL_FLAGS, HIGH_FLAGS,
     MEDIUM_FLAGS,
@@ -488,7 +488,13 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
     let mut unknown_samples: Vec<String> = Vec::new();
 
     for (name, hit) in entries {
-        if is_allowed_flag(name) {
+        if is_allowed_flag(name) || is_memory_baseline_flag(name) {
+            // Skip both Roblox's official allowlist AND the TSB-community
+            // memory baseline. The latter is flags whose NAMES live in
+            // every vanilla Roblox process because the runtime references
+            // them — the string being in memory doesn't mean a value was
+            // ever set. The client_settings scanner handles the value-set
+            // case separately and ignores this baseline.
             continue;
         }
         let is_known = known.contains(name.as_str());
