@@ -9,7 +9,7 @@ use crate::data::suspicious_flags::{
 };
 use crate::models::{ScanFinding, ScanVerdict};
 use crate::scanners::progress::ScanProgress;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Known FFlag prefixes. Any identifier matching `<prefix><IdentBody>` where
 /// the body is a camel-cased identifier is a candidate flag name. We treat
@@ -80,6 +80,29 @@ impl FlagHitTable {
     }
     fn total_flags(&self) -> usize {
         self.hits.len()
+    }
+
+    /// Fold another table into this one. Used by the parallel scanner to
+    /// combine per-worker tables at the end of the region walk. Preserves
+    /// the lowest observed `first_address` across workers so the final
+    /// finding points at the earliest sighting, not a random one.
+    fn merge(&mut self, other: FlagHitTable) {
+        for (name, h) in other.hits {
+            match self.hits.entry(name) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let existing = e.get_mut();
+                    if existing.count == 0 || h.first_address < existing.first_address {
+                        existing.first_address = h.first_address;
+                    }
+                    existing.count = existing.count.saturating_add(h.count);
+                    existing.seen_wide |= h.seen_wide;
+                    existing.seen_ascii |= h.seen_ascii;
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(h);
+                }
+            }
+        }
     }
 }
 
@@ -221,150 +244,158 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Generic prefix scan: walks every byte, and at each position checks whether
-/// a known flag prefix appears followed by a camel-cased identifier body.
-/// Boundary-checked so prefixes embedded inside other identifiers are ignored.
-/// Returns tuples of (flag_name_start_in_buffer, full_name_string, is_known).
+/// Cached set of every known suspicious flag name, for O(1) lookups from
+/// the hot ASCII-scan loop. Before this cache each candidate triggered three
+/// linear scans over the CRITICAL/HIGH/MEDIUM arrays (~300 string compares
+/// per hit).
+fn known_flag_set() -> &'static HashSet<&'static str> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut s: HashSet<&'static str> = HashSet::with_capacity(
+            CRITICAL_FLAGS.len() + HIGH_FLAGS.len() + MEDIUM_FLAGS.len(),
+        );
+        s.extend(CRITICAL_FLAGS.iter().copied());
+        s.extend(HIGH_FLAGS.iter().copied());
+        s.extend(MEDIUM_FLAGS.iter().copied());
+        s
+    })
+}
+
+/// Generic prefix scan. Every FFlag prefix starts with `D`, `F`, or `S`, so
+/// we use `memchr3` to skip directly to candidate positions instead of
+/// touching every byte. On random binary data this cuts the inner loop from
+/// ~N iterations to ~N/256 — a single 16 MiB chunk of non-identifier bytes
+/// becomes a handful of `pcmpeqb`/`pmovmskb` ops instead of 16 million
+/// per-byte prefix-compare passes.
+///
+/// At each candidate position we still do: left-boundary, prefix match,
+/// uppercase-body-start, body-length + contextual boundary checks —
+/// identical semantics to the pre-memchr version.
+/// Returns tuples of (offset_in_buffer, full_name, is_known_or_allowed).
 fn scan_prefix_hits(buffer: &[u8]) -> Vec<(usize, String, bool)> {
     let mut out: Vec<(usize, String, bool)> = Vec::new();
-
     if buffer.is_empty() {
         return out;
     }
+    let known = known_flag_set();
 
-    let mut i = 0usize;
-    while i < buffer.len() {
-        // Try each known prefix at this position.
-        let mut matched_prefix: Option<&str> = None;
+    let mut cursor = 0usize;
+    while cursor < buffer.len() {
+        let rel = match memchr::memchr3(b'D', b'F', b'S', &buffer[cursor..]) {
+            Some(o) => o,
+            None => break,
+        };
+        let i = cursor + rel;
+        // Tentatively advance one byte; if we find a full identifier below we
+        // jump past it to skip its interior.
+        cursor = i + 1;
+
+        // Left boundary: previous byte must not be an ident byte.
+        if i > 0 && is_ident_byte(buffer[i - 1]) {
+            continue;
+        }
+
+        let mut matched_prefix: Option<&'static str> = None;
         for &prefix in FLAG_PREFIXES {
             let pb = prefix.as_bytes();
             if i + pb.len() > buffer.len() {
                 continue;
             }
-            if &buffer[i..i + pb.len()] != pb {
-                continue;
+            // Cheap first-byte check already passed (memchr3), but prefixes
+            // share first letters so still need the full compare.
+            if &buffer[i..i + pb.len()] == pb {
+                matched_prefix = Some(prefix);
+                break;
             }
-            matched_prefix = Some(prefix);
-            break;
         }
-
         let prefix = match matched_prefix {
             Some(p) => p,
-            None => {
-                i += 1;
-                continue;
-            }
+            None => continue,
         };
 
-        // Left boundary: the byte before the prefix must not be an identifier byte.
-        if i > 0 && is_ident_byte(buffer[i - 1]) {
-            i += 1;
-            continue;
-        }
-
-        // Walk the identifier body after the prefix.
+        // Body must start with an uppercase ASCII letter (real flags are
+        // camel-cased), followed by at least MIN_IDENT_BODY_LEN ident bytes.
         let body_start = i + prefix.len();
-        // First body byte must be an uppercase ASCII letter — real Roblox flag
-        // bodies are camel-case (e.g. FFlagDebug...). This tightens the match
-        // against random `FInt` bytes in binary data that happen to continue
-        // with non-letters or lowercase letters.
         if body_start >= buffer.len() {
-            i += 1;
             continue;
         }
-        let first_body = buffer[body_start];
-        if !(first_body.is_ascii_uppercase()) {
-            i += 1;
+        if !buffer[body_start].is_ascii_uppercase() {
             continue;
         }
 
         let mut j = body_start;
-        while j < buffer.len() && j - body_start < MAX_IDENT_BODY_LEN && is_ident_byte(buffer[j]) {
+        while j < buffer.len()
+            && j - body_start < MAX_IDENT_BODY_LEN
+            && is_ident_byte(buffer[j])
+        {
             j += 1;
         }
         let body_len = j - body_start;
         if body_len < MIN_IDENT_BODY_LEN {
-            i += 1;
             continue;
         }
 
         let total_len = prefix.len() + body_len;
-
-        // Right boundary: already enforced (we stopped at a non-ident byte or buffer end).
-        // Contextual check to reduce random binary false positives.
         if !is_contextual_match(buffer, i, total_len) {
-            i += 1;
             continue;
         }
 
-        // Full identifier as a UTF-8 string. All bytes in [i, j) are ASCII by construction.
         let name = match std::str::from_utf8(&buffer[i..j]) {
             Ok(s) => s.to_string(),
-            Err(_) => {
-                i += 1;
-                continue;
-            }
+            Err(_) => continue,
         };
 
-        let is_known = CRITICAL_FLAGS.iter().any(|&f| f == name)
-            || HIGH_FLAGS.iter().any(|&f| f == name)
-            || MEDIUM_FLAGS.iter().any(|&f| f == name)
-            || is_allowed_flag(&name);
-
+        let is_known = known.contains(name.as_str()) || is_allowed_flag(&name);
         out.push((i, name, is_known));
-        // Advance past this identifier to avoid re-matching its interior.
-        i = j;
+        // Jump past the identifier so its interior isn't re-examined.
+        cursor = j;
     }
 
     out
 }
 
-/// Cached UTF-16LE encodings of every known suspicious flag, computed once
-/// per process. Without this cache `scan_wide_known` re-encoded the entire
-/// catalog (~250 strings) on every chunk, in the hot loop.
-fn known_wide_encodings() -> &'static [(&'static str, Vec<u8>)] {
+/// Cached Aho-Corasick automaton over the UTF-16LE encodings of every known
+/// suspicious flag. Replaces the previous per-pattern linear scan which did
+/// `N * patterns` byte compares (~278 passes over each chunk). A single AC
+/// pass is O(N + matches) — for a 16 MiB chunk that's ~50 ms instead of
+/// ~20 s on typical hardware.
+///
+/// The returned tuple keeps the parallel slice of `&'static` flag names
+/// aligned with pattern indices so `Match::pattern()` → name is O(1).
+fn known_wide_automaton() -> &'static (aho_corasick::AhoCorasick, Vec<&'static str>) {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<Vec<(&'static str, Vec<u8>)>> = OnceLock::new();
+    static CACHE: OnceLock<(aho_corasick::AhoCorasick, Vec<&'static str>)> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let mut v: Vec<(&'static str, Vec<u8>)> =
+        let mut names: Vec<&'static str> =
             Vec::with_capacity(CRITICAL_FLAGS.len() + HIGH_FLAGS.len() + MEDIUM_FLAGS.len());
-        v.extend(CRITICAL_FLAGS.iter().map(|&f| (f, to_utf16le(f))));
-        v.extend(HIGH_FLAGS.iter().map(|&f| (f, to_utf16le(f))));
-        v.extend(MEDIUM_FLAGS.iter().map(|&f| (f, to_utf16le(f))));
-        v
+        names.extend(CRITICAL_FLAGS.iter().copied());
+        names.extend(HIGH_FLAGS.iter().copied());
+        names.extend(MEDIUM_FLAGS.iter().copied());
+        let patterns: Vec<Vec<u8>> = names.iter().map(|n| to_utf16le(n)).collect();
+        let ac = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::Standard)
+            .build(&patterns)
+            .expect("aho-corasick automaton build should not fail over static flag set");
+        (ac, names)
     })
 }
 
-/// Scan a buffer for UTF-16LE occurrences of any known suspicious flag name.
-/// This is targeted (against known lists) rather than generic, because
-/// UTF-16 noise generates unacceptable false-positive rates otherwise.
-fn scan_wide_known(
-    buffer: &[u8],
-    base_address: usize,
-    table: &mut FlagHitTable,
-) {
-    let known = known_wide_encodings();
-
-    for (name, wbytes) in known {
-        if wbytes.len() > buffer.len() {
+/// Scan a buffer for UTF-16LE occurrences of any known suspicious flag name
+/// using the cached Aho-Corasick automaton. Targeted (against known lists)
+/// rather than generic because UTF-16 noise generates unacceptable
+/// false-positive rates otherwise.
+fn scan_wide_known(buffer: &[u8], base_address: usize, table: &mut FlagHitTable) {
+    let (ac, names) = known_wide_automaton();
+    for m in ac.find_iter(buffer) {
+        let start = m.start();
+        let len = m.end() - start;
+        if !is_wide_boundary_ok(buffer, start, len) {
             continue;
         }
-        let end = buffer.len() - wbytes.len();
-        let mut i = 0usize;
-        // Step by 1 rather than 2: UTF-16 strings embedded inside packed
-        // structures or at arbitrary byte offsets can land at odd alignments.
-        // Byte-level scanning is the only way to catch them reliably.
-        while i <= end {
-            if &buffer[i..i + wbytes.len()] == wbytes.as_slice()
-                && is_wide_boundary_ok(buffer, i, wbytes.len())
-            {
-                let address = base_address.saturating_add(i);
-                table.record(name, address, true);
-                i += wbytes.len();
-            } else {
-                i += 1;
-            }
-        }
+        let name = names[m.pattern().as_usize()];
+        let address = base_address.saturating_add(start);
+        table.record(name, address, true);
     }
 }
 
@@ -490,8 +521,11 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
+    use rayon::prelude::*;
     use std::ffi::c_void;
     use std::mem;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, MAX_PATH};
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Memory::{
@@ -524,6 +558,75 @@ mod windows_impl {
         // Longest prefix is "DFString" / "SFString" at 8 chars.
         let max_name = 8 + MAX_IDENT_BODY_LEN;
         max_name * 2 + 4
+    }
+
+    /// `HANDLE` is a raw pointer (`*mut c_void`) and therefore neither `Send`
+    /// nor `Sync` by default. Windows guarantees that handles obtained via
+    /// `OpenProcess` are safe to use concurrently from multiple threads, so
+    /// we wrap it in a newtype and assert those markers manually. Scoped to
+    /// the per-scan parallel fan-out only.
+    #[derive(Copy, Clone)]
+    struct HandleWrapper(HANDLE);
+    unsafe impl Send for HandleWrapper {}
+    unsafe impl Sync for HandleWrapper {}
+
+    /// Read every chunk of a single committed region into `scratch` and feed
+    /// it to `scan_buffer`, updating the worker-local `FlagHitTable` and the
+    /// shared atomic counters. Checks `timed_out` between chunks so the
+    /// watchdog can abort mid-region.
+    fn scan_region_into(
+        local: &mut FlagHitTable,
+        scratch: &mut Vec<u8>,
+        handle: HANDLE,
+        addr: usize,
+        size: usize,
+        overlap: usize,
+        bytes_scanned: &AtomicU64,
+        regions_scanned: &AtomicUsize,
+        timed_out: &AtomicBool,
+    ) {
+        if scratch.capacity() < MAX_CHUNK_BYTES {
+            scratch.reserve(MAX_CHUNK_BYTES - scratch.capacity());
+        }
+        let mut offset = 0usize;
+        while offset < size {
+            if timed_out.load(Ordering::Relaxed) {
+                return;
+            }
+            let this_chunk = (size - offset).min(MAX_CHUNK_BYTES);
+            // SAFETY: `scratch` has capacity >= MAX_CHUNK_BYTES >= this_chunk.
+            // We never read `scratch[..this_chunk]` unless `ReadProcessMemory`
+            // writes into it — and then only the `bytes_read` prefix it
+            // actually filled. Avoids the ~16 MiB memset the old
+            // `resize(this_chunk, 0)` path performed per chunk.
+            unsafe {
+                scratch.set_len(this_chunk);
+            }
+            let mut bytes_read: usize = 0;
+            let read_ok = unsafe {
+                ReadProcessMemory(
+                    handle,
+                    (addr + offset) as *const c_void,
+                    scratch.as_mut_ptr() as *mut c_void,
+                    this_chunk,
+                    &mut bytes_read,
+                )
+            };
+            if read_ok != 0 && bytes_read > 0 {
+                bytes_scanned.fetch_add(bytes_read as u64, Ordering::Relaxed);
+                scan_buffer(&scratch[..bytes_read], addr + offset, local);
+            } else {
+                offset = offset.saturating_add(this_chunk);
+                continue;
+            }
+            let advance = if this_chunk > overlap {
+                this_chunk - overlap
+            } else {
+                this_chunk
+            };
+            offset = offset.saturating_add(advance);
+        }
+        regions_scanned.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) async fn scan_windows(reporter: ScanProgress) -> Vec<ScanFinding> {
@@ -575,149 +678,180 @@ mod windows_impl {
         // (1) Enumerate loaded modules, flag any outside trusted paths.
         findings.extend(scan_modules_windows(handle.0, pid));
 
-        // (2) Walk committed regions.
-        let mut table = FlagHitTable::default();
-
-        let mut address: usize = 0;
-        let mut mem_info: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
-        let mem_info_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
+        // ---- Phase A: enumerate regions (sequential, metadata only). ----
+        // VirtualQueryEx is a fast kernel call that just returns region info;
+        // the heavy work is the ReadProcessMemory in phase B. Splitting the
+        // two lets us fan phase B across rayon workers without serializing
+        // the enum loop.
+        let mut regions_to_scan: Vec<(usize, usize)> = Vec::new();
         let mut rwx_hits = 0usize;
-        let mut regions_scanned = 0usize;
         let mut regions_walked = 0usize;
-        let mut bytes_scanned: u64 = 0;
         let mut truncated_regions = 0usize;
         let mut scan_completed = false;
 
         let overlap = chunk_overlap_bytes();
-        // Reuse a single scratch buffer across all chunks; the previous code
-        // allocated up to 16 MiB per iteration in the hot loop.
-        let mut scratch: Vec<u8> = Vec::with_capacity(MAX_CHUNK_BYTES);
 
-        // Heartbeat pacing: emit a progress event at most every ~400ms so the
-        // UI can show live counters without us flooding the IPC bridge.
-        let heartbeat_interval = std::time::Duration::from_millis(400);
-        let mut last_heartbeat = std::time::Instant::now();
+        {
+            let mut address: usize = 0;
+            let mut mem_info: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
+            let mem_info_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
 
-        // Wall-clock safety cap — see MAX_SCAN_DURATION docstring.
-        let scan_started = std::time::Instant::now();
-        let mut timed_out = false;
-
-        loop {
-            if regions_walked >= MAX_REGIONS_WALKED {
-                break;
-            }
-
-            if scan_started.elapsed() >= MAX_SCAN_DURATION {
-                timed_out = true;
-                break;
-            }
-
-            if last_heartbeat.elapsed() >= heartbeat_interval {
-                reporter.heartbeat("memory_scanner", regions_scanned, bytes_scanned);
-                last_heartbeat = std::time::Instant::now();
-            }
-
-            let result = unsafe {
-                VirtualQueryEx(handle.0, address as *const c_void, &mut mem_info, mem_info_size)
-            };
-            if result == 0 {
-                // VirtualQueryEx returns 0 at end-of-user-address-space — treat as normal completion.
-                scan_completed = true;
-                break;
-            }
-            regions_walked += 1;
-
-            let region_size = mem_info.RegionSize;
-            let protect = mem_info.Protect;
-            let state = mem_info.State;
-            let region_type = mem_info.Type;
-
-            let is_guard = (protect & PAGE_GUARD) != 0;
-            let base_protect = protect & 0xFF;
-
-            if state == MEM_COMMIT && region_size > 0 && !is_guard {
-                let is_rwx = base_protect == PAGE_EXECUTE_READWRITE
-                    || base_protect == PAGE_EXECUTE_WRITECOPY;
-                let is_readable = matches!(
-                    base_protect,
-                    PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ
-                ) || is_rwx;
-
-                if is_rwx {
-                    rwx_hits += 1;
-                    findings.push(ScanFinding::new(
-                        "memory_scanner",
-                        ScanVerdict::Flagged,
-                        format!(
-                            "RWX memory region in Roblox process ({} KB) — possible shellcode or runtime-patched code",
-                            region_size / 1024
-                        ),
-                        Some(format!(
-                            "Address: 0x{:X}, Size: {} bytes, Protection: 0x{:X}",
-                            address, region_size, protect
-                        )),
-                    ));
+            loop {
+                if regions_walked >= MAX_REGIONS_WALKED {
+                    break;
                 }
+                let result = unsafe {
+                    VirtualQueryEx(
+                        handle.0,
+                        address as *const c_void,
+                        &mut mem_info,
+                        mem_info_size,
+                    )
+                };
+                if result == 0 {
+                    scan_completed = true;
+                    break;
+                }
+                regions_walked += 1;
 
-                // Only scan heap/private/mapped regions for strings. MEM_IMAGE
-                // (file-backed .text/.rdata) contains every flag name as a
-                // literal on a vanilla client, producing false positives we
-                // can't disambiguate for the ASCII scan.
-                let is_image = region_type == MEM_IMAGE;
-                if is_readable && !is_image {
-                    let effective_size = region_size.min(ABS_REGION_CAP);
-                    if effective_size < region_size {
-                        truncated_regions += 1;
+                let region_size = mem_info.RegionSize;
+                let protect = mem_info.Protect;
+                let state = mem_info.State;
+                let region_type = mem_info.Type;
+
+                let is_guard = (protect & PAGE_GUARD) != 0;
+                let base_protect = protect & 0xFF;
+
+                if state == MEM_COMMIT && region_size > 0 && !is_guard {
+                    let is_rwx = base_protect == PAGE_EXECUTE_READWRITE
+                        || base_protect == PAGE_EXECUTE_WRITECOPY;
+                    let is_readable = matches!(
+                        base_protect,
+                        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ
+                    ) || is_rwx;
+
+                    if is_rwx {
+                        rwx_hits += 1;
+                        findings.push(ScanFinding::new(
+                            "memory_scanner",
+                            ScanVerdict::Flagged,
+                            format!(
+                                "RWX memory region in Roblox process ({} KB) — possible shellcode or runtime-patched code",
+                                region_size / 1024
+                            ),
+                            Some(format!(
+                                "Address: 0x{:X}, Size: {} bytes, Protection: 0x{:X}",
+                                address, region_size, protect
+                            )),
+                        ));
                     }
 
-                    // Chunked read with overlap so boundary-straddling hits are not missed.
-                    let mut offset = 0usize;
-                    while offset < effective_size {
-                        let this_chunk = (effective_size - offset).min(MAX_CHUNK_BYTES);
-                        scratch.clear();
-                        scratch.resize(this_chunk, 0);
-                        let mut bytes_read: usize = 0;
-                        let read_ok = unsafe {
-                            ReadProcessMemory(
-                                handle.0,
-                                (address + offset) as *const c_void,
-                                scratch.as_mut_ptr() as *mut c_void,
-                                this_chunk,
-                                &mut bytes_read,
-                            )
-                        };
-                        if read_ok != 0 && bytes_read > 0 {
-                            scratch.truncate(bytes_read);
-                            bytes_scanned = bytes_scanned.saturating_add(bytes_read as u64);
-                            scan_buffer(&scratch, address + offset, &mut table);
-                        } else {
-                            // Unreadable chunk — advance past it without an overlap replay.
-                            offset = offset.saturating_add(this_chunk);
-                            continue;
+                    // Only scan heap/private/mapped regions for strings.
+                    // MEM_IMAGE (file-backed .text/.rdata) contains every
+                    // flag name as a literal on a vanilla client, producing
+                    // false positives we can't disambiguate for the ASCII
+                    // scan.
+                    let is_image = region_type == MEM_IMAGE;
+                    if is_readable && !is_image {
+                        let effective_size = region_size.min(ABS_REGION_CAP);
+                        if effective_size < region_size {
+                            truncated_regions += 1;
                         }
-
-                        let advance = if this_chunk > overlap {
-                            this_chunk - overlap
-                        } else {
-                            this_chunk
-                        };
-                        offset = offset.saturating_add(advance);
+                        regions_to_scan.push((address, effective_size));
                     }
-                    regions_scanned += 1;
                 }
-            }
 
-            // Advance. Guard against a zero-sized region returning — would otherwise infinite-loop.
-            if region_size == 0 {
-                break;
+                if region_size == 0 {
+                    break;
+                }
+                let next = address.wrapping_add(region_size);
+                if next <= address {
+                    scan_completed = true;
+                    break;
+                }
+                address = next;
             }
-            let next = address.wrapping_add(region_size);
-            if next <= address {
-                scan_completed = true;
-                break;
-            }
-            address = next;
         }
+
+        // ---- Phase B: parallel region scan. ----
+        // Each rayon worker owns a reusable scratch buffer and a local
+        // FlagHitTable; tables are merged at the end via `.reduce`.
+        let bytes_scanned = Arc::new(AtomicU64::new(0));
+        let regions_scanned = Arc::new(AtomicUsize::new(0));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Watchdog + heartbeat: a single thread that both emits periodic
+        // progress events and flips the shared `timed_out` flag when the
+        // wall-clock cap is hit. Workers poll `timed_out` between chunks,
+        // giving a ~1× chunk worst-case abort latency (~500ms on modern HW).
+        let hb_bytes = bytes_scanned.clone();
+        let hb_regions = regions_scanned.clone();
+        let hb_timeout = timed_out.clone();
+        let hb_shutdown = shutdown.clone();
+        let hb_reporter = reporter.clone();
+        let scan_started = std::time::Instant::now();
+        let hb_thread = std::thread::spawn(move || {
+            let interval = std::time::Duration::from_millis(400);
+            loop {
+                std::thread::park_timeout(interval);
+                if hb_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                if scan_started.elapsed() >= MAX_SCAN_DURATION {
+                    hb_timeout.store(true, Ordering::Relaxed);
+                    break;
+                }
+                hb_reporter.heartbeat(
+                    "memory_scanner",
+                    hb_regions.load(Ordering::Relaxed),
+                    hb_bytes.load(Ordering::Relaxed),
+                );
+            }
+        });
+
+        let hw = HandleWrapper(handle.0);
+        let table = regions_to_scan
+            .par_iter()
+            .fold(
+                || (FlagHitTable::default(), Vec::<u8>::with_capacity(MAX_CHUNK_BYTES)),
+                |(mut local, mut scratch), &(addr, size)| {
+                    if !timed_out.load(Ordering::Relaxed) {
+                        scan_region_into(
+                            &mut local,
+                            &mut scratch,
+                            hw.0,
+                            addr,
+                            size,
+                            overlap,
+                            &bytes_scanned,
+                            &regions_scanned,
+                            &timed_out,
+                        );
+                    }
+                    (local, scratch)
+                },
+            )
+            .map(|(t, _)| t)
+            .reduce(FlagHitTable::default, |mut a, b| {
+                a.merge(b);
+                a
+            });
+
+        // Stop the heartbeat thread. `unpark` wakes it immediately so we
+        // don't pay up to 400ms of sleep latency at the end of every scan.
+        shutdown.store(true, Ordering::Relaxed);
+        hb_thread.thread().unpark();
+        let _ = hb_thread.join();
+
+        let bytes_scanned_final = bytes_scanned.load(Ordering::Relaxed);
+        let regions_scanned_final = regions_scanned.load(Ordering::Relaxed);
+        let timed_out_final = timed_out.load(Ordering::Relaxed);
+        // Shadow the names the legacy reporting block below used, so the
+        // diff between old and new is minimal.
+        let bytes_scanned = bytes_scanned_final;
+        let regions_scanned = regions_scanned_final;
+        let timed_out = timed_out_final;
 
         // Emit flag findings.
         findings.extend(findings_from_table(&table));
