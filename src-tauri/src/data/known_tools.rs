@@ -37,7 +37,13 @@ pub static KNOWN_PROCESS_NAMES: &[&str] = &[
     "sirhurt",
     "jjsploit",
     "nezur",
-    "swift",
+    // "swift" was previously listed as a Roblox executor substring but it
+    // matches a huge class of legitimate processes — SwiftTunnel (Apple's
+    // Network Extension framework used by most macOS VPNs), Swift
+    // Playgrounds, swiftformat, swift-build, and so on. Any standalone
+    // Swift-branded Roblox tooling should ship with a more specific name
+    // under KNOWN_TOOL_FILENAMES instead of a bare three-letter-ish
+    // substring.
     "velocity",
     "comet",
     "vega-x",
