@@ -81,11 +81,15 @@ pub async fn run_all_scans_with_progress(reporter: ScanProgress) -> Vec<ScanFind
                 all_findings.append(&mut findings);
             }
             Err(e) => {
+                // A scanner task panic is a tooling bug, not a cheat signal.
+                // Surface it as Inconclusive so the operator knows coverage
+                // was incomplete, but never let a transient JoinError flip
+                // the overall verdict to Suspicious.
                 let msg = format!("Scanner task panicked: {}", e);
                 reporter.errored(scanner_id, msg.clone());
                 all_findings.push(ScanFinding::new(
                     "scanner_runtime",
-                    crate::models::ScanVerdict::Suspicious,
+                    crate::models::ScanVerdict::Inconclusive,
                     msg,
                     None,
                 ));

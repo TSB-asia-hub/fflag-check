@@ -2,9 +2,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Verdict indicating the severity of a scan finding.
+///
+/// Ordering (lowest → highest): `Clean` < `Inconclusive` < `Suspicious` < `Flagged`.
+/// `Inconclusive` is reserved for environmental / permission / runtime failures
+/// that prevent the scanner from concluding either way — it MUST NOT be used
+/// as a softer "maybe cheating" label. The overall verdict promotes to
+/// `Inconclusive` only when there are no Suspicious/Flagged findings.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ScanVerdict {
     Clean,
+    Inconclusive,
     Suspicious,
     Flagged,
 }

@@ -263,6 +263,7 @@ button {
 .summary--clean .summary__dot { background: var(--clean); }
 .summary--warn .summary__dot { background: var(--warn); }
 .summary--danger .summary__dot { background: var(--danger); }
+.summary--inconclusive .summary__dot { background: var(--text-muted); }
 .summary--scanning .summary__dot { background: var(--warn); animation: blink 1.1s var(--ease) infinite; }
 
 @keyframes blink {
@@ -295,6 +296,11 @@ button {
 .summary__count--clean .summary__count-num { color: var(--clean); }
 .summary__count--warn .summary__count-num { color: var(--warn); }
 .summary__count--danger .summary__count-num { color: var(--danger); }
+.summary__count--inconclusive .summary__count-num { color: var(--text-muted); }
+
+/* When a count is 0, drop the colored treatment — a red "00" next to a
+   Clean verdict was reading as a false alarm at a glance. */
+.summary__count--zero .summary__count-num { color: var(--text-faint); }
 
 .summary__count-label {
   font-size: 11px;
@@ -481,6 +487,7 @@ button {
 .filter-chip--clean .filter-chip__dot { background: var(--clean); }
 .filter-chip--warn .filter-chip__dot { background: var(--warn); }
 .filter-chip--danger .filter-chip__dot { background: var(--danger); }
+.filter-chip--inconclusive .filter-chip__dot { background: var(--text-muted); }
 
 .filter-chip:hover {
   border-color: var(--text-faint);
@@ -517,6 +524,7 @@ button {
 .row--clean .row__bar { background: var(--clean); }
 .row--suspicious .row__bar { background: var(--warn); }
 .row--flagged .row__bar { background: var(--danger); }
+.row--inconclusive .row__bar { background: var(--text-muted); }
 
 .row__module {
   font-family: var(--font-mono);
@@ -552,6 +560,7 @@ button {
 .row--clean .row__verdict { color: var(--clean); }
 .row--suspicious .row__verdict { color: var(--warn); }
 .row--flagged .row__verdict { color: var(--danger); }
+.row--inconclusive .row__verdict { color: var(--text-muted); }
 
 .row__time {
   font-family: var(--font-mono);
@@ -673,6 +682,7 @@ button {
 .statusbar__dot--warn { background: var(--warn); animation: blink 1.1s var(--ease) infinite; }
 .statusbar__dot--susp { background: var(--warn); }
 .statusbar__dot--flag { background: var(--danger); }
+.statusbar__dot--inconclusive { background: var(--text-muted); }
 
 /* ——————————————————————————————————————————————————————————————
    Toast

@@ -37,9 +37,96 @@ pub fn is_allowed_flag(flag_name: &str) -> bool {
 
 /// Memory-scan baseline: flag names whose mere presence in Roblox process
 /// memory is known-not-interesting and should be suppressed from findings.
-/// Intentionally empty; see the MEMORY_SOFT_FINDINGS list below for the
-/// softer-downgrade mechanism the TSB-common flags now use.
-pub static MEMORY_BASELINE_FLAGS: &[&str] = &[];
+///
+/// Roblox loads its entire FFlag registry (~20k names) into heap at startup.
+/// The mere presence of any of these names as a string in heap is therefore
+/// evidence of nothing — Roblox itself put them there. This list covers
+/// Roblox-shipped A/B rollout, telemetry, UI modernization, and rendering
+/// rollout flags that would otherwise fire on every vanilla client.
+///
+/// Only the memory scanner consults this list. If any of these names appear
+/// in a local ClientAppSettings.json or bootstrapper config with a non-
+/// default value, the client_settings scanner still flags them at full
+/// severity — actively writing the value is a real override regardless of
+/// how common the name is in heap.
+///
+/// DFIntS2PhysicsSenderRate is deliberately NOT on this list (see the test
+/// `canonical_desync_flag_stays_at_full_severity`): it is the canonical
+/// memory-only desync override and must retain its Flagged severity.
+pub static MEMORY_BASELINE_FLAGS: &[&str] = &[
+    // ---- Chrome in-game menu rollout (shipped default on modern clients) ----
+    "FFlagEnableInGameMenuChromeABTest2",
+    "FFlagEnableInGameMenuChromeABTest4",
+    "FFlagEnableIngameMenuChrome",
+    "FFlagEnableInGameMenuSongbirdABTest",
+    "FFlagEnableChromePinnedChat",
+    // ---- Beta badges / cosmetic UI A-B (no gameplay effect) ----
+    "FFlagVoiceBetaBadge",
+    "FFlagTopBarUseNewBadge",
+    "FFlagEnableBetaBadgeLearnMore",
+    "FFlagBetaBadgeLearnMoreLinkFormview",
+    "FFlagControlBetaBadgeWithGuac",
+    "FFlagCoreGuiTypeSelfViewPresent",
+    // ---- Roblox-side network rollout toggles (server-controlled) ----
+    "FFlagOptimizeNetwork",
+    "FFlagOptimizeNetworkRouting",
+    "FFlagOptimizeNetworkTransport",
+    "FFlagOptimizeServerTickRate",
+    // ---- Shipped FPS-cap feature (not an uncap) ----
+    "FFlagGameBasicSettingsFramerateCap",
+    "FFlagGameBasicSettingsFramerateCap5",
+    "FFlagTaskSchedulerLimitTargetFpsTo2402",
+    // ---- Shipped rendering feature flags (not cheats on their own) ----
+    "FFlagGlobalWindRendering",
+    "FFlagGlobalWindActivated",
+    "FFlagRenderFixFog",
+    "FFlagRenderFixGrassPrepass",
+    "FFlagUnifiedLightingBetaFeature",
+    "FFlagRenderUnifiedLighting6",
+    "FFlagFastGPULightCulling3",
+    "FFlagNewLightAttenuation",
+    "FFlagRenderNoLowFrmBloom",
+    // ---- Bug-fix toggles named "Fix*" (not disable-fix toggles) ----
+    "FFlagCommitToGraphicsQualityFix",
+    "FFlagFixGraphicsQuality",
+    // ---- Built-in user-facing features (Shift-F5 FPS, quick launch, …) ----
+    "FFlagDebugDisplayFPS",
+    "FFlagEnableQuickGameLaunch",
+    "FFlagEnableCommandAutocomplete",
+    "FFlagEnableBubbleChatFromChatService",
+    // ---- Shipped GUI-hide accessibility API ----
+    "FFlagUserShowGuiHideToggles",
+    "FFlagGuiHidingApiSupport2",
+    "DFIntCanHideGuiGroupId",
+    // ---- Server-controlled reconnect kill-switches (client value ignored) ----
+    "FFlagReconnectDisabled",
+    "FStringReconnectDisabledReason",
+    // ---- UIBlox theming (Lua app chrome) ----
+    "FFlagLuaAppUseUIBloxColorPalettes1",
+    "FFlagUIBloxUseNewThemeColorPalettes",
+    // ---- Engine-internal render threading assertions ----
+    "FFlagDebugCheckRenderThreading",
+    "FFlagRenderDebugCheckThreading2",
+    "FFlagRenderCheckThreading",
+    "FFlagDebugRenderingSetDeterministic",
+    // ---- Ad service toggle (privacy choice, not a cheat) ----
+    "FFlagAdServiceEnabled",
+    // ---- Telemetry / logging verbosity ----
+    "FLogNetwork",
+    // ---- Engine-internal debug overlays (developer tools, not ESP) ----
+    "FFlagDebugDisplayUnthemedInstances",
+    "FFlagDebugLightGridShowChunks",
+    "FFlagTrackerLodControllerDebugUI",
+    // ---- Internal migration/patching scaffolding ----
+    "FFlagDataModelPatcherForceLocal",
+    "FFlagRefactorPlayerConnect",
+    "FFlagDebugLocalRccServerConnection",
+    // ---- Animation system corrections ----
+    "FFlagQuaternionPoseCorrection",
+    "FFlagRigScaleShouldAffectAnimations",
+    // ---- Reporting flow rollout ----
+    "FFlagEnableReportAbuseMenuRoactABTest2",
+];
 
 /// TSB-community ambiguous flags. Commonly observed in The Strongest
 /// Battlegrounds player memory across both vanilla and modified clients;
@@ -60,7 +147,15 @@ pub static MEMORY_BASELINE_FLAGS: &[&str] = &[];
 /// canonical desync / fake-lag override and must retain its Flagged
 /// severity in memory as well as in config files.
 pub static MEMORY_SOFT_FINDINGS: &[&str] = &[
-    // ---- Caller-provided "CRITICAL" tier minus DFIntS2PhysicsSenderRate ----
+    // Names that MAY be injector-written OR Roblox-internal — not confident
+    // enough either way to silence outright (that's MEMORY_BASELINE_FLAGS)
+    // nor flag at full severity. Cap to Suspicious and keep an inspectable
+    // row for tournament staff.
+    //
+    // Entries that have since been proven to be Roblox-shipped registry
+    // names were moved to MEMORY_BASELINE_FLAGS; do not re-add them here.
+    //
+    // ---- Physics / replication engine defaults ----
     "DFIntBulletContactBreakOrthogonalThresholdPercent",
     "DFIntBulletContactBreakThresholdPercent",
     "DFIntDebugDefaultTargetWorldStepsPerFrame",
@@ -77,15 +172,10 @@ pub static MEMORY_SOFT_FINDINGS: &[&str] = &[
     "FFlagProcessAnimationLooped",
     "FFlagRemapAnimationR6ToR15Rig",
     "FFlagSimAdaptiveTimesteppingDefault2",
-    // ---- Caller-provided "HIGH" tier ----
+    // ---- Rendering engine defaults ----
     "DFFlagDebugDrawEnable",
-    "DFIntCanHideGuiGroupId",
     "DFIntPerformanceControlTextureQualityBestUtility",
     "DFIntTextureCompositorActiveJobs",
-    "FFlagDataModelPatcherForceLocal",
-    "FFlagGuiHidingApiSupport2",
-    "FFlagUnifiedLightingBetaFeature",
-    "FFlagUserShowGuiHideToggles",
     "FIntCameraFarZPlane",
     "FIntCameraMaxZoomDistance",
     "FIntMaxCameraMaxZoomDistance",
@@ -93,29 +183,15 @@ pub static MEMORY_SOFT_FINDINGS: &[&str] = &[
     "FIntTextureCompositorLowResFactor",
     "FStringTerrainMaterialTable2022",
     "FStringTerrainMaterialTablePre2022",
-    // ---- Caller-provided "MEDIUM" tier ----
+    // ---- Assorted engine internals ----
     "DFFlagOrder66",
     "DFFlagUseVisBugChecks",
     "DFIntCSGv2LodsToGenerate",
     "DFIntDebugSimPhysicsSteppingMethodOverride",
     "DFIntRaknetBandwidthPingSendEveryXSeconds",
-    "FFlagAdServiceEnabled",
-    "FFlagControlBetaBadgeWithGuac",
-    "FFlagEnableBubbleChatFromChatService",
-    "FFlagEnableInGameMenuChromeABTest4",
-    "FFlagEnableInGameMenuSongbirdABTest",
-    "FFlagFastGPULightCulling3",
-    "FFlagGameBasicSettingsFramerateCap5",
-    "FFlagRenderDebugCheckThreading2",
-    "FFlagRenderFixGrassPrepass",
-    "FFlagRenderNoLowFrmBloom",
-    "FFlagRigScaleShouldAffectAnimations",
-    "FFlagTaskSchedulerLimitTargetFpsTo2402",
-    "FFlagTopBarUseNewBadge",
     "FIntFullscreenTitleBarTriggerDelayMillis",
     "FIntRuntimeMaxNumOfThreads",
     "FIntTaskSchedulerThreadMin",
-    "FLogNetwork",
 ];
 
 /// True if this flag name is an ambiguous TSB-community memory finding
@@ -154,21 +230,48 @@ mod tests {
     }
 
     #[test]
-    fn memory_baseline_stays_empty() {
-        // The full-suppression baseline is reserved for future flags that
-        // are proven Roblox-internal AND high-volume false positives. The
-        // TSB-common list uses MEMORY_SOFT_FINDINGS instead, which fires
-        // at Suspicious severity rather than silencing.
-        assert!(MEMORY_BASELINE_FLAGS.is_empty());
+    fn memory_baseline_covers_known_roblox_shipped_names() {
+        // The baseline silences flag names Roblox itself loads into process
+        // heap via its runtime flag registry. Without these entries the
+        // memory scanner would fire Suspicious/Flagged findings on every
+        // vanilla client that has the registry resident (which is every
+        // live client, per memory_scanner.rs:582-588). Pin the canonical
+        // samples so a cleanup cannot accidentally re-empty the list.
+        assert!(is_memory_baseline_flag("FFlagAdServiceEnabled"));
+        assert!(is_memory_baseline_flag("FFlagTopBarUseNewBadge"));
+        assert!(is_memory_baseline_flag("FFlagEnableInGameMenuChromeABTest4"));
+        assert!(is_memory_baseline_flag("FFlagUnifiedLightingBetaFeature"));
+        assert!(is_memory_baseline_flag("FFlagGameBasicSettingsFramerateCap5"));
+        assert!(is_memory_baseline_flag("FLogNetwork"));
+        assert!(is_memory_baseline_flag("FFlagRenderFixFog"));
+        assert!(is_memory_baseline_flag("FFlagDebugDisplayFPS"));
     }
 
     #[test]
     fn memory_soft_findings_cover_tsb_sample() {
-        // Pin one sample per tier the soft list draws from so a cleanup
-        // accidentally removing an entry fails CI.
+        // Pin canonical ambiguous names so a cleanup accidentally removing
+        // an entry fails CI. Genuinely-shipped names belong in
+        // MEMORY_BASELINE_FLAGS, not here.
         assert!(is_memory_soft_finding("DFIntMaxActiveAnimationTracks"));
-        assert!(is_memory_soft_finding("FFlagUnifiedLightingBetaFeature"));
-        assert!(is_memory_soft_finding("FLogNetwork"));
+        assert!(is_memory_soft_finding("FFlagSimAdaptiveTimesteppingDefault2"));
+        assert!(is_memory_soft_finding("DFIntMinimalSimRadiusBuffer"));
+    }
+
+    #[test]
+    fn memory_soft_and_baseline_are_disjoint() {
+        // Baseline silences entirely; soft demotes to Suspicious. A name on
+        // both is ambiguous signalling — baseline wins in findings_from_table
+        // but the redundancy makes the soft list misleading. Keep them
+        // disjoint.
+        for &soft in MEMORY_SOFT_FINDINGS {
+            assert!(
+                !MEMORY_BASELINE_FLAGS.contains(&soft),
+                "{} is on both MEMORY_SOFT_FINDINGS and MEMORY_BASELINE_FLAGS; \
+                 if it is Roblox-shipped, remove from soft findings — baseline \
+                 silences it",
+                soft
+            );
+        }
     }
 
     #[test]

@@ -59,18 +59,25 @@ impl ScanReport {
     }
 
     /// Compute the overall verdict from all findings.
-    /// If any Flagged -> Flagged, if any Suspicious -> Suspicious, else Clean.
+    /// Priority: Flagged > Suspicious > Inconclusive > Clean. Inconclusive is
+    /// surfaced only when nothing stronger was found — this keeps environmental
+    /// failures (timeout, permission denied, scanner panic) visible without
+    /// pretending they are cheat signals.
     pub fn compute_verdict(&self) -> ScanVerdict {
         let mut has_suspicious = false;
+        let mut has_inconclusive = false;
         for f in &self.findings {
             match f.verdict {
                 ScanVerdict::Flagged => return ScanVerdict::Flagged,
                 ScanVerdict::Suspicious => has_suspicious = true,
+                ScanVerdict::Inconclusive => has_inconclusive = true,
                 ScanVerdict::Clean => {}
             }
         }
         if has_suspicious {
             ScanVerdict::Suspicious
+        } else if has_inconclusive {
+            ScanVerdict::Inconclusive
         } else {
             ScanVerdict::Clean
         }

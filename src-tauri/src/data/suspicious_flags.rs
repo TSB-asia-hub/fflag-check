@@ -249,20 +249,23 @@ pub static HIGH_FLAGS: &[&str] = &[
     "DFFlagDebugRenderForceTechnologyVoxel",
     "FFlagDebugForceFutureIsBrightPhase2",
     "FFlagDebugForceFutureIsBrightPhase3",
-    // Unified lighting manipulation
-    "FFlagRenderUnifiedLighting6",
-    "FFlagUnifiedLightingBetaFeature",
+    // (FFlagRenderUnifiedLighting6 and FFlagUnifiedLightingBetaFeature are
+    // Roblox-shipped unified-lighting rollout gates; see MEMORY_BASELINE_FLAGS.
+    // They are present in vanilla client memory on every run and setting
+    // them in ClientAppSettings does not confer competitive advantage. Do
+    // not re-add without a documented cheat-value for the suspicious DB.)
 
-    // ---- Post-processing / fog / wind removal ----
+    // ---- Post-processing removal ----
     "FFlagDisablePostFx",
-    "FFlagGlobalWindRendering",
-    "FFlagGlobalWindActivated",
-    "FFlagRenderFixFog",
+    // (FFlagGlobalWindRendering / FFlagGlobalWindActivated are shipped
+    // Roblox Global Wind feature toggles; FFlagRenderFixFog is a bug-fix
+    // toggle, not a fog-removal cheat. All three moved to baseline.)
 
     // ---- GUI hiding for competitive advantage ----
-    "FFlagUserShowGuiHideToggles",
-    "FFlagGuiHidingApiSupport2",
-    "DFIntCanHideGuiGroupId",
+    // (FFlagUserShowGuiHideToggles / FFlagGuiHidingApiSupport2 /
+    // DFIntCanHideGuiGroupId are the shipped Roblox GUI-hide accessibility
+    // API — moved to MEMORY_BASELINE_FLAGS. Force-hiding HUD via debug
+    // flags is still a real knob, so the following two stay.)
     // Dont render screen GUI (hide all UI overlays)
     "FFlagDebugDontRenderScreenGui",
     "FFlagDebugDontRenderUI",
@@ -318,11 +321,12 @@ pub static HIGH_FLAGS: &[&str] = &[
 
     // ---- Disconnect / reconnect manipulation ----
     "DFFlagDebugDisableTimeoutDisconnect",
-    "FFlagReconnectDisabled",
-    "FStringReconnectDisabledReason",
+    // (FFlagReconnectDisabled / FStringReconnectDisabledReason are
+    // Roblox-side kill-switches; client-local values are ignored by the
+    // server. Moved to MEMORY_BASELINE_FLAGS.)
 
-    // ---- Force data model patching ----
-    "FFlagDataModelPatcherForceLocal",
+    // (FFlagDataModelPatcherForceLocal is an internal migration toggle,
+    // not a cheat vector — moved to MEMORY_BASELINE_FLAGS.)
 ];
 
 // =============================================================================
@@ -332,10 +336,12 @@ pub static HIGH_FLAGS: &[&str] = &[
 // =============================================================================
 pub static MEDIUM_FLAGS: &[&str] = &[
     // ---- FPS uncapping / task scheduler manipulation ----
+    // The numeric `DFIntTaskSchedulerTargetFps` and refresh-rate bounds
+    // remain suspicious because user-chosen values drive the behavior.
+    // The shipped feature-gate bools (`FFlagTaskSchedulerLimitTargetFpsTo2402`,
+    // `FFlagGameBasicSettingsFramerateCap*`) are Roblox's own rollout
+    // toggles — presence in heap is expected; moved to MEMORY_BASELINE_FLAGS.
     "DFIntTaskSchedulerTargetFps",
-    "FFlagTaskSchedulerLimitTargetFpsTo2402",
-    "FFlagGameBasicSettingsFramerateCap",
-    "FFlagGameBasicSettingsFramerateCap5",
     "FIntTargetRefreshRate",
     "FIntRefreshRateLowerBound",
 
@@ -348,14 +354,13 @@ pub static MEDIUM_FLAGS: &[&str] = &[
     "FFlagDebugDisableTelemetryV2Event",
     "FFlagDebugDisableTelemetryV2Stat",
 
-    // ---- Ad service disabling ----
-    "FFlagAdServiceEnabled",
+    // (FFlagAdServiceEnabled is a privacy/preference toggle that Bloxstrap
+    // ships disabled by default — no competitive-advantage. Moved to
+    // MEMORY_BASELINE_FLAGS.)
 
     // ---- Network optimization (potential desync at extreme values) ----
-    "FFlagOptimizeNetwork",
-    "FFlagOptimizeNetworkRouting",
-    "FFlagOptimizeNetworkTransport",
-    "FFlagOptimizeServerTickRate",
+    // FFlagOptimize* boolean rollouts are Roblox-side staged rollouts;
+    // client value is advisory. Numeric tuning stays suspicious.
     "DFIntConnectionMTUSize",
     "DFIntNetworkLatencyTolerance",
     "DFIntNetworkPrediction",
@@ -370,18 +375,19 @@ pub static MEDIUM_FLAGS: &[&str] = &[
 
     // ---- Graphics quality override ----
     // (DFIntDebugFRMQualityLevelOverride is on Roblox's allowlist —
-    // removed; the others stay.)
+    // removed. `FFlagCommitToGraphicsQualityFix` and `FFlagFixGraphicsQuality`
+    // are "Fix*" bug-fix toggles — shipped true by default — moved to
+    // MEMORY_BASELINE_FLAGS.)
     "FIntRomarkStartWithGraphicQualityLevel",
-    "FFlagCommitToGraphicsQualityFix",
-    "FFlagFixGraphicsQuality",
 
     // ---- Light update frequency reduction ----
     "FIntRenderLocalLightUpdatesMax",
     "FIntRenderLocalLightUpdatesMin",
     "FIntRenderLocalLightFadeInMs",
 
-    // ---- New light attenuation ----
-    "FFlagNewLightAttenuation",
+    // (FFlagNewLightAttenuation is a Roblox rendering-rollout bool; moved
+    // to MEMORY_BASELINE_FLAGS. No meaningful competitive advantage from
+    // either state.)
 
     // ---- CSG LOD switching ----
     // (The four DFIntCSGLevelOfDetailSwitchingDistance* flags are on
@@ -398,44 +404,26 @@ pub static MEDIUM_FLAGS: &[&str] = &[
     "FIntRuntimeMaxNumOfThreads",
     "FIntTaskSchedulerThreadMin",
 
-    // ---- Rendering threading checks ----
-    "FFlagDebugCheckRenderThreading",
-    "FFlagRenderDebugCheckThreading2",
-    "FFlagRenderCheckThreading",
-    "FFlagDebugRenderingSetDeterministic",
+    // (Render-threading assertion toggles were engine-internal correctness
+    // checks that slowed rendering if anything — moved to MEMORY_BASELINE_FLAGS.)
 
     // ---- DPI scale manipulation ----
     // (DFFlagDisableDPIScale is allowlisted — removed.)
 
     // ---- UI manipulation ----
-    "FFlagEnableInGameMenuChromeABTest2",
-    "FFlagEnableInGameMenuChromeABTest4",
-    "FFlagEnableIngameMenuChrome",
-    "FFlagEnableInGameMenuSongbirdABTest",
-    "FFlagEnableChromePinnedChat",
-    "FFlagEnableBubbleChatFromChatService",
-    "FFlagCoreGuiTypeSelfViewPresent",
-    "FIntFullscreenTitleBarTriggerDelayMillis",
+    // (Chrome / in-game menu / bubble-chat / self-view / BETA-badge
+    // rollouts are all Roblox-shipped UI A/B flags — moved to
+    // MEMORY_BASELINE_FLAGS. Keep numeric padding/blur knobs only.)
     "FIntFontSizePadding",
     "FIntRobloxGuiBlurIntensity",
 
-    // ---- Badge / UI element hiding ----
-    "FFlagVoiceBetaBadge",
-    "FFlagTopBarUseNewBadge",
-    "FFlagEnableBetaBadgeLearnMore",
-    "FFlagBetaBadgeLearnMoreLinkFormview",
-    "FFlagControlBetaBadgeWithGuac",
-    "FStringVoiceBetaBadgeLearnMoreLink",
-    "FStringTopBarBadgeLearnMoreLink",
-
     // ---- Report abuse menu manipulation ----
     "FStringReportAbuseMenuRoactForcedUserIds",
-    "FFlagEnableReportAbuseMenuRoactABTest2",
     "FFlagEnableReportAbuseMenuRoact2",
     "FFlagEnableReportAbuseMenuLayerOnV3",
 
-    // ---- Display FPS overlay ----
-    "FFlagDebugDisplayFPS",
+    // (FFlagDebugDisplayFPS is the Shift-F5 built-in overlay — user-facing
+    // documented feature, not a cheat — moved to MEMORY_BASELINE_FLAGS.)
 
     // ---- Debug flag state display ----
     "FStringDebugShowFlagState",
@@ -462,25 +450,20 @@ pub static MEDIUM_FLAGS: &[&str] = &[
     // ---- Order66 (misc debug flag) ----
     "DFFlagOrder66",
 
-    // ---- Quaternion / animation override ----
-    "FFlagQuaternionPoseCorrection",
-    "FFlagRigScaleShouldAffectAnimations",
+    // (Quaternion/RigScale animation-system corrections are Roblox-side
+    // migration fixes; moved to MEMORY_BASELINE_FLAGS.)
 
     // ---- Avatar chat visualization ----
     "FFlagDebugAvatarChatVisualization",
 
-    // ---- GPU light culling ----
-    "FFlagFastGPULightCulling3",
+    // (FFlagFastGPULightCulling3 is a staged rendering-perf rollout; moved
+    // to MEMORY_BASELINE_FLAGS.)
 
     // ---- Deferred lighting disable ----
     "FFlagDebugDisableDeferredLighting",
 
-    // ---- Lua color palettes (UI theming) ----
-    "FFlagLuaAppUseUIBloxColorPalettes1",
-    "FFlagUIBloxUseNewThemeColorPalettes",
-
-    // ---- Render bloom removal ----
-    "FFlagRenderNoLowFrmBloom",
+    // (UIBlox theming and the low-FRM bloom fade are cosmetic Roblox
+    // rollouts; moved to MEMORY_BASELINE_FLAGS.)
 
     // ---- Vis bug checks (can affect rendering) ----
     "DFFlagUseVisBugChecks",
@@ -488,14 +471,9 @@ pub static MEDIUM_FLAGS: &[&str] = &[
     "FFlagVisBugChecksThreadYield",
     "FIntEnableVisBugChecksHundredthPercent27",
 
-    // ---- Quick game launch ----
-    "FFlagEnableQuickGameLaunch",
-
-    // ---- Command autocomplete ----
-    "FFlagEnableCommandAutocomplete",
-
-    // ---- Grass render fix ----
-    "FFlagRenderFixGrassPrepass",
+    // (Quick-launch, chat /command autocomplete, and grass render fix are
+    // shipped feature gates with no competitive effect; moved to
+    // MEMORY_BASELINE_FLAGS.)
 
     // ---- Camera input type manipulation ----
     "FFlagUserCameraControlLastInputTypeUpdate",

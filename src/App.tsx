@@ -10,7 +10,7 @@ const APP_VERSION =
   typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "?";
 
 type Phase = "idle" | "scanning" | "complete";
-type Filter = "all" | "flagged" | "suspicious" | "clean";
+type Filter = "all" | "flagged" | "suspicious" | "inconclusive" | "clean";
 
 // Display metadata for each scanner. The `id` is the stable identifier the
 // backend uses in `scan-progress` events — keep in sync with SCANNER_IDS
@@ -215,16 +215,21 @@ function AppInner() {
   }, [report, exportInFlight]);
 
   const counts = useMemo(() => {
-    if (!report) return { clean: 0, suspicious: 0, flagged: 0, total: 0 };
+    if (!report)
+      return { clean: 0, inconclusive: 0, suspicious: 0, flagged: 0, total: 0 };
     return report.findings.reduce(
       (acc, f) => {
         if (f.verdict === "Clean") acc.clean++;
+        else if (f.verdict === "Inconclusive") acc.inconclusive++;
         else if (f.verdict === "Suspicious") acc.suspicious++;
-        else acc.flagged++;
+        else if (f.verdict === "Flagged") acc.flagged++;
+        // Silently ignore unknown verdict strings rather than bucketing
+        // them into `flagged` — a counts chip showing "01" with no
+        // matching row would confuse operators.
         acc.total++;
         return acc;
       },
-      { clean: 0, suspicious: 0, flagged: 0, total: 0 },
+      { clean: 0, inconclusive: 0, suspicious: 0, flagged: 0, total: 0 },
     );
   }, [report]);
 
@@ -233,7 +238,8 @@ function AppInner() {
     const rank: Record<ScanVerdict, number> = {
       Flagged: 0,
       Suspicious: 1,
-      Clean: 2,
+      Inconclusive: 2,
+      Clean: 3,
     };
     const sorted = [...report.findings].sort(
       (a, b) => rank[a.verdict] - rank[b.verdict],
@@ -379,7 +385,13 @@ function Summary({
 }: {
   phase: Phase;
   report: ScanReport | null;
-  counts: { clean: number; suspicious: number; flagged: number; total: number };
+  counts: {
+    clean: number;
+    inconclusive: number;
+    suspicious: number;
+    flagged: number;
+    total: number;
+  };
   progress: ProgressMap;
 }) {
   const completedCount = SCANNERS.filter(
@@ -390,11 +402,13 @@ function Summary({
       ? "summary--scanning"
       : phase === "complete" && report?.overall_verdict === "Clean"
         ? "summary--clean"
-        : phase === "complete" && report?.overall_verdict === "Suspicious"
-          ? "summary--warn"
-          : phase === "complete" && report?.overall_verdict === "Flagged"
-            ? "summary--danger"
-            : "";
+        : phase === "complete" && report?.overall_verdict === "Inconclusive"
+          ? "summary--inconclusive"
+          : phase === "complete" && report?.overall_verdict === "Suspicious"
+            ? "summary--warn"
+            : phase === "complete" && report?.overall_verdict === "Flagged"
+              ? "summary--danger"
+              : "";
 
   const verdictLabel =
     phase === "idle"
@@ -471,19 +485,45 @@ function Summary({
           </div>
         ) : (
           <div className="summary__counts">
-            <span className="summary__count summary__count--danger">
+            <span
+              className={
+                "summary__count summary__count--danger" +
+                (counts.flagged === 0 ? " summary__count--zero" : "")
+              }
+            >
               <span className="summary__count-num">
                 {String(counts.flagged).padStart(2, "0")}
               </span>
               <span className="summary__count-label">flag</span>
             </span>
-            <span className="summary__count summary__count--warn">
+            <span
+              className={
+                "summary__count summary__count--warn" +
+                (counts.suspicious === 0 ? " summary__count--zero" : "")
+              }
+            >
               <span className="summary__count-num">
                 {String(counts.suspicious).padStart(2, "0")}
               </span>
               <span className="summary__count-label">susp</span>
             </span>
-            <span className="summary__count summary__count--clean">
+            <span
+              className={
+                "summary__count summary__count--inconclusive" +
+                (counts.inconclusive === 0 ? " summary__count--zero" : "")
+              }
+            >
+              <span className="summary__count-num">
+                {String(counts.inconclusive).padStart(2, "0")}
+              </span>
+              <span className="summary__count-label">incl</span>
+            </span>
+            <span
+              className={
+                "summary__count summary__count--clean" +
+                (counts.clean === 0 ? " summary__count--zero" : "")
+              }
+            >
               <span className="summary__count-num">
                 {String(counts.clean).padStart(2, "0")}
               </span>
@@ -534,12 +574,24 @@ function Workarea({
   openKey: string | null;
   onToggle: (key: string) => void;
   onScan: () => void;
-  counts: { clean: number; suspicious: number; flagged: number; total: number };
+  counts: {
+    clean: number;
+    inconclusive: number;
+    suspicious: number;
+    flagged: number;
+    total: number;
+  };
 }) {
   const chips: { key: Filter; label: string; modifier: string; count: number }[] = [
     { key: "all", label: "All", modifier: "", count: counts.total },
     { key: "flagged", label: "Flag", modifier: "filter-chip--danger", count: counts.flagged },
     { key: "suspicious", label: "Susp", modifier: "filter-chip--warn", count: counts.suspicious },
+    {
+      key: "inconclusive",
+      label: "Incl",
+      modifier: "filter-chip--inconclusive",
+      count: counts.inconclusive,
+    },
     { key: "clean", label: "Clean", modifier: "filter-chip--clean", count: counts.clean },
   ];
 
@@ -650,7 +702,13 @@ const FindingRow = memo(function FindingRow({
   const cls = `row row--${f.verdict.toLowerCase()} ${open ? "row--open" : ""}`;
   // Verdict glyph supplements color so colorblind users still see severity.
   const glyph =
-    f.verdict === "Flagged" ? "✕" : f.verdict === "Suspicious" ? "▲" : "•";
+    f.verdict === "Flagged"
+      ? "✕"
+      : f.verdict === "Suspicious"
+        ? "▲"
+        : f.verdict === "Inconclusive"
+          ? "?"
+          : "•";
   const handleClick = useCallback(() => onToggle(rowKey), [onToggle, rowKey]);
   const handleKey = useCallback(
     (e: ReactKeyboardEvent) => {
@@ -714,9 +772,11 @@ function StatusBar({
         ? "statusbar__dot statusbar__dot--flag"
         : phase === "complete" && report?.overall_verdict === "Suspicious"
           ? "statusbar__dot statusbar__dot--susp"
-          : phase === "complete"
-            ? "statusbar__dot statusbar__dot--live"
-            : "statusbar__dot";
+          : phase === "complete" && report?.overall_verdict === "Inconclusive"
+            ? "statusbar__dot statusbar__dot--inconclusive"
+            : phase === "complete"
+              ? "statusbar__dot statusbar__dot--live"
+              : "statusbar__dot";
 
   return (
     <footer className="statusbar">

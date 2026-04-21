@@ -104,9 +104,21 @@ pub static KNOWN_TOOL_FILENAMES: &[&str] = &[
     "odessa.exe",
 ];
 
-/// Known tool directory names (relative to common installation roots).
-pub static KNOWN_TOOL_DIRS: &[&str] = &[
+/// Directory names for Roblox-specific FFlag injection / bypass tools. These
+/// have no legitimate non-cheat use and warrant a Suspicious verdict.
+pub static ROBLOX_CHEAT_DIRS: &[&str] = &[
     "Voidstrap",
+    "ExtremeInjector",
+    "FFlagToolkit",
+    "LornoBypass",
+    "fflag-manager",
+];
+
+/// Directory names for generic reverse-engineering / debugging tools. These
+/// have well-known legitimate uses (CTF, malware analysis, driver debugging,
+/// security research) and firing Suspicious on presence alone punishes the
+/// entire security community. Recorded as Clean informational notes only.
+pub static GENERIC_RE_TOOL_DIRS: &[&str] = &[
     "CheatEngine",
     "Cheat Engine",
     "x64dbg",
@@ -114,11 +126,11 @@ pub static KNOWN_TOOL_DIRS: &[&str] = &[
     "SystemInformer",
     "ReClass.NET",
     "HxD",
-    "ExtremeInjector",
-    "FFlagToolkit",
-    "LornoBypass",
-    "fflag-manager",
 ];
+
+// Legacy `KNOWN_TOOL_DIRS` constant removed — use `ROBLOX_CHEAT_DIRS` (emit
+// Suspicious) or `GENERIC_RE_TOOL_DIRS` (emit Clean informational) directly
+// so each call site picks the right severity explicitly.
 
 /// Known tool executable SHA-256 hashes (lowercase hex). Matched even when the
 /// binary has been renamed. Keep this list to cross-platform artefacts the

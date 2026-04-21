@@ -2,7 +2,9 @@
 // exercised by the Windows path or the unit tests. Silence dead_code there.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-use crate::data::flag_allowlist::{is_allowed_flag, is_memory_soft_finding};
+use crate::data::flag_allowlist::{
+    is_allowed_flag, is_memory_baseline_flag, is_memory_soft_finding,
+};
 use crate::data::suspicious_flags::{
     get_flag_category, get_flag_description, get_flag_severity, CRITICAL_FLAGS, HIGH_FLAGS,
     MEDIUM_FLAGS,
@@ -124,9 +126,9 @@ pub async fn scan_with_progress(reporter: ScanProgress) -> Vec<ScanFinding> {
         let _ = reporter; // unused on non-Windows
         vec![ScanFinding::new(
             "memory_scanner",
-            ScanVerdict::Clean,
+            ScanVerdict::Inconclusive,
             "Memory scan not supported on this platform",
-            Some("Memory scanning is Windows-only in this build.".to_string()),
+            Some("Memory scanning is Windows-only in this build — the scan result reflects only process/file/client-settings coverage.".to_string()),
         )]
     }
 }
@@ -232,7 +234,13 @@ fn is_contextual_match(buffer: &[u8], start: usize, len: usize) -> bool {
     } else {
         None
     };
-    let is_delim = |b: u8| matches!(b, b'"' | b':' | b'=' | b'{' | b',' | b' ' | b'\t' | 0);
+    // NUL was previously accepted here as a delimiter, but NUL-padded C
+    // strings (and the runtime's interned flag-name registry strings) end
+    // with NUL. Accepting it meant every Roblox-internal reference to a
+    // suspicious flag name trivially passed the "looks like config context"
+    // check. Require an actual JSON / config-file delimiter on at least one
+    // side, and reject matches bounded by NUL on both sides.
+    let is_delim = |b: u8| matches!(b, b'"' | b':' | b'=' | b'{' | b',' | b' ' | b'\t');
     let before_ok = before.map(is_delim).unwrap_or(true);
     let after_ok = after.map(is_delim).unwrap_or(true);
     before_ok && after_ok
@@ -491,6 +499,13 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
         if is_allowed_flag(name) {
             continue;
         }
+        // Roblox loads its entire FFlag registry (~20k names) into heap at
+        // startup; the mere presence of a baseline-shipped name is zero
+        // evidence of injection. Silence before severity assignment so the
+        // finding never surfaces.
+        if is_memory_baseline_flag(name) {
+            continue;
+        }
         let is_soft = is_memory_soft_finding(name);
         let is_known = known.contains(name.as_str());
 
@@ -722,36 +737,43 @@ mod windows_impl {
 
         let pid = proc.pid;
 
-        // Refuse to scan a Roblox-named process whose executable lives outside
-        // a trusted install root. Otherwise a player can drop a renamed decoy
-        // (e.g. an empty binary called `robloxplayerbeta.exe`) and silently
-        // redirect the memory scan to it, getting a false-clean.
+        // If the Roblox process's exe path doesn't match a known install root
+        // we can't vouch for it — but we also can't hard-Flag the user for
+        // having installed Roblox in an unusual location (OneDrive-redirected
+        // LocalAppData, portable D:\ install, Sober/Rokstrap, custom Bloxstrap
+        // root, …). Emit an Inconclusive note and continue the scan — any
+        // real decoy will still be caught by the memory / module checks below
+        // because a blank binary has no Roblox strings in heap.
+        let mut findings: Vec<ScanFinding> = Vec::new();
         if !proc.path_looks_trusted {
-            return vec![ScanFinding::new(
+            findings.push(ScanFinding::new(
                 "memory_scanner",
-                ScanVerdict::Flagged,
-                "Roblox-named process has an untrusted executable path — refusing to scan (possible decoy)",
+                ScanVerdict::Inconclusive,
+                "Roblox-named process has an unrecognized executable path — proceeding with memory scan but cannot attest install integrity",
                 Some(format!(
                     "PID: {} | Path: {}",
                     pid,
                     proc.exe_path.as_deref().unwrap_or("<unknown>")
                 )),
-            )];
+            ));
         }
 
         let raw_handle: HANDLE =
             unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid) };
         if raw_handle.is_null() {
-            return vec![ScanFinding::new(
+            // Non-admin / PPL-protected / AV-hooked processes routinely deny
+            // PROCESS_VM_READ. This is expected environmental behavior on
+            // modern Windows, not evidence of cheating. Inconclusive lets the
+            // operator know coverage was zero without accusing the player.
+            findings.push(ScanFinding::new(
                 "memory_scanner",
-                ScanVerdict::Suspicious,
+                ScanVerdict::Inconclusive,
                 "Memory scan unavailable: insufficient permissions to read Roblox process (try running as Administrator)",
                 Some(format!("PID: {}", pid)),
-            )];
+            ));
+            return findings;
         }
         let handle = ScopedHandle(raw_handle);
-
-        let mut findings = Vec::new();
 
         // (1) Enumerate loaded modules, flag any outside trusted paths.
         findings.extend(scan_modules_windows(handle.0, pid));
@@ -801,20 +823,30 @@ mod windows_impl {
                 let base_protect = protect & 0xFF;
 
                 if state == MEM_COMMIT && region_size > 0 && !is_guard {
-                    let is_rwx = base_protect == PAGE_EXECUTE_READWRITE
-                        || base_protect == PAGE_EXECUTE_WRITECOPY;
+                    // True RWX (writable + executable) is what we care about.
+                    // PAGE_EXECUTE_WRITECOPY was previously grouped here but
+                    // it is the STANDARD Windows protection assigned to a
+                    // PE's code section before first write (copy-on-write);
+                    // every vanilla process has these. Luau's native code
+                    // generator can also allocate RWX transiently. Flag
+                    // EXECUTE_READWRITE only, and only as Suspicious — a
+                    // single transient JIT page should not auto-disqualify
+                    // honest players.
+                    let is_rwx = base_protect == PAGE_EXECUTE_READWRITE;
+                    let is_write_copy = base_protect == PAGE_EXECUTE_WRITECOPY;
                     let is_readable = matches!(
                         base_protect,
                         PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ
-                    ) || is_rwx;
+                    ) || is_rwx
+                        || is_write_copy;
 
                     if is_rwx {
                         rwx_hits += 1;
                         findings.push(ScanFinding::new(
                             "memory_scanner",
-                            ScanVerdict::Flagged,
+                            ScanVerdict::Suspicious,
                             format!(
-                                "RWX memory region in Roblox process ({} KB) — possible shellcode or runtime-patched code",
+                                "RWX memory region in Roblox process ({} KB) — possible shellcode or runtime-patched code (may also be Luau JIT)",
                                 region_size / 1024
                             ),
                             Some(format!(
@@ -943,11 +975,13 @@ mod windows_impl {
         // Emit flag findings.
         findings.extend(findings_from_table(&table));
 
-        // Honest summary.
+        // Honest summary. Environmental / coverage failures are
+        // Inconclusive, not Suspicious — slow disks, large processes, and
+        // truncated kernel enums are not evidence of cheating.
         if timed_out {
             findings.push(ScanFinding::new(
                 "memory_scanner",
-                ScanVerdict::Suspicious,
+                ScanVerdict::Inconclusive,
                 format!(
                     "Memory scan aborted after {}s wall-clock cap — cannot attest clean state",
                     MAX_SCAN_DURATION.as_secs()
@@ -960,7 +994,7 @@ mod windows_impl {
         } else if !scan_completed || regions_scanned == 0 {
             findings.push(ScanFinding::new(
                 "memory_scanner",
-                ScanVerdict::Suspicious,
+                ScanVerdict::Inconclusive,
                 "Memory scan incomplete: region enumeration terminated early — cannot attest clean state",
                 Some(format!(
                     "PID: {}, regions_walked: {}, regions_scanned: {}, bytes: {}",
@@ -981,7 +1015,7 @@ mod windows_impl {
         if truncated_regions > 0 {
             findings.push(ScanFinding::new(
                 "memory_scanner",
-                ScanVerdict::Suspicious,
+                ScanVerdict::Inconclusive,
                 "One or more memory regions exceeded scan cap and were only partially scanned",
                 Some(format!(
                     "PID: {}, truncated_regions: {}, per_region_cap_bytes: {}",
@@ -1023,9 +1057,12 @@ mod windows_impl {
                 )
             };
             if ok == 0 {
+                // EnumProcessModulesEx returning 0 is common during DLL
+                // load/unload races, with AV/EDR hooks, or on PPL-protected
+                // processes — not cheat evidence.
                 findings.push(ScanFinding::new(
                     "memory_scanner",
-                    ScanVerdict::Suspicious,
+                    ScanVerdict::Inconclusive,
                     "Could not enumerate modules in Roblox process",
                     Some(format!("PID: {}", pid)),
                 ));
@@ -1041,7 +1078,7 @@ mod windows_impl {
             if new_len <= modules.len() {
                 findings.push(ScanFinding::new(
                     "memory_scanner",
-                    ScanVerdict::Suspicious,
+                    ScanVerdict::Inconclusive,
                     "Module enumeration truncated; could not grow buffer",
                     Some(format!("PID: {}, needed: {}", pid, needed)),
                 ));
@@ -1075,9 +1112,11 @@ mod windows_impl {
                 };
             }
             if len == 0 {
+                // Transient: module unloaded between enumeration and path
+                // query, or path is restricted by PPL. Not cheat evidence.
                 findings.push(ScanFinding::new(
                     "memory_scanner",
-                    ScanVerdict::Suspicious,
+                    ScanVerdict::Inconclusive,
                     "Module present in Roblox process with unreadable path",
                     Some(format!("PID: {}", pid)),
                 ));
@@ -1161,23 +1200,53 @@ mod windows_impl {
         roots.push(format!("{}\\assembly\\", sys_root).to_lowercase());
         roots.push(format!("{}\\Microsoft.NET\\", sys_root).to_lowercase());
 
-        if let Ok(pf) = std::env::var("ProgramFiles") {
-            roots.push(format!("{}\\Roblox\\", pf).to_lowercase());
-            // Only the Roblox UWP package family — not the entire WindowsApps store.
-            roots.push(format!("{}\\WindowsApps\\ROBLOXCORPORATION.", pf).to_lowercase());
+        // Common third-party publishers whose DLLs routinely get injected
+        // system-wide: GPU drivers, peripheral control suites, overlay
+        // software, anti-cheat shims. Without these, every gamer with
+        // normal hardware trips the untrusted-module heuristic.
+        for pf_var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(pf) = std::env::var(pf_var) {
+                let pf_lower = pf.to_lowercase();
+                roots.push(format!("{}\\roblox\\", pf_lower));
+                roots.push(format!("{}\\nvidia corporation\\", pf_lower));
+                roots.push(format!("{}\\amd\\", pf_lower));
+                roots.push(format!("{}\\intel\\", pf_lower));
+                roots.push(format!("{}\\realtek\\", pf_lower));
+                roots.push(format!("{}\\razer\\", pf_lower));
+                roots.push(format!("{}\\logitech\\", pf_lower));
+                roots.push(format!("{}\\corsair\\", pf_lower));
+                roots.push(format!("{}\\steelseries\\", pf_lower));
+                roots.push(format!("{}\\steam\\", pf_lower));
+                roots.push(format!("{}\\discord\\", pf_lower));
+                roots.push(format!("{}\\obs-studio\\", pf_lower));
+                roots.push(format!("{}\\easyanticheat\\", pf_lower));
+                roots.push(format!("{}\\battleye\\", pf_lower));
+                roots.push(format!("{}\\common files\\", pf_lower));
+                // Roblox UWP package family (not the entire Store).
+                if pf_var == "ProgramFiles" {
+                    roots.push(format!(
+                        "{}\\windowsapps\\robloxcorporation.",
+                        pf_lower
+                    ));
+                }
+            }
         }
-        if let Ok(pfx86) = std::env::var("ProgramFiles(x86)") {
-            roots.push(format!("{}\\Roblox\\", pfx86).to_lowercase());
-        }
+
         if let Ok(local) = std::env::var("LocalAppData") {
-            roots.push(format!("{}\\Roblox\\", local).to_lowercase());
+            let local_lower = local.to_lowercase();
+            roots.push(format!("{}\\roblox\\", local_lower));
             // Only Roblox UWP package family, not every per-user UWP package.
-            roots.push(format!("{}\\Packages\\ROBLOXCORPORATION.", local).to_lowercase());
+            roots.push(format!("{}\\packages\\robloxcorporation.", local_lower));
             // Bloxstrap / Fishstrap ship legitimate Roblox binaries under
             // these paths; required so modules loaded by a bootstrap-launched
             // Roblox are not treated as untrusted.
-            roots.push(format!("{}\\Bloxstrap\\Versions\\", local).to_lowercase());
-            roots.push(format!("{}\\Fishstrap\\Versions\\", local).to_lowercase());
+            roots.push(format!("{}\\bloxstrap\\versions\\", local_lower));
+            roots.push(format!("{}\\fishstrap\\versions\\", local_lower));
+            // User-scoped installs of Discord (Electron in %LocalAppData%)
+            // and NVIDIA overlay components.
+            roots.push(format!("{}\\discord\\", local_lower));
+            roots.push(format!("{}\\nvidia\\", local_lower));
+            roots.push(format!("{}\\nvidia corporation\\", local_lower));
         }
 
         roots
@@ -1192,15 +1261,29 @@ mod windows_impl {
     }
 
     fn is_high_risk_module_path(path_lower: &str) -> bool {
-        // Substring-only matches are kept narrow. `\public\` was previously
-        // included but matches the legitimate `C:\Users\Public\Documents\...`
-        // shared-user directory, so it was dropped.
+        // Anchor `\desktop\` and `\downloads\` to the resolved user profile
+        // prefix rather than matching anywhere in the path. Previously any
+        // DLL path containing those segments (e.g. `C:\games\Desktop Widgets`
+        // or `C:\...\OneDrive - Work\Desktop\...`) produced a hard Flagged
+        // verdict. The anchored form still catches a real injector running
+        // from the user's actual Downloads/Desktop folder.
+        let userprofile_lower = std::env::var("UserProfile")
+            .ok()
+            .map(|p| p.to_lowercase());
+        if let Some(up) = userprofile_lower {
+            let user_desktop = format!("{}\\desktop\\", up);
+            let user_downloads = format!("{}\\downloads\\", up);
+            if path_lower.starts_with(&user_desktop) || path_lower.starts_with(&user_downloads) {
+                return true;
+            }
+        }
+        // Writable staging directories retain unanchored substring match —
+        // legitimate software almost never loads DLLs from %TEMP%, and an
+        // `\injected\` segment is intentionally named that way by tooling.
         const HIGH_RISK_SUBSTRS: &[&str] = &[
             "\\temp\\",
             "\\tmp\\",
-            "\\downloads\\",
             "\\appdata\\local\\temp\\",
-            "\\desktop\\",
             "\\injected\\",
         ];
         HIGH_RISK_SUBSTRS.iter().any(|s| path_lower.contains(s))

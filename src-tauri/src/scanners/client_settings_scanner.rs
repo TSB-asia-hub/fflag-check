@@ -44,9 +44,11 @@ pub async fn scan() -> Vec<ScanFinding> {
                 }
             }
             Err(e) => {
+                // Read failure is an environmental condition (permission
+                // denied, file racing disappearance). Not cheat evidence.
                 findings.push(ScanFinding::new(
                     "client_settings_scanner",
-                    ScanVerdict::Suspicious,
+                    ScanVerdict::Inconclusive,
                     format!("Could not read ClientAppSettings.json: {}", e),
                     Some(format!("Path: {}", path.display())),
                 ));
@@ -80,13 +82,33 @@ pub async fn scan() -> Vec<ScanFinding> {
     // 2. Check bootstrapper configs (AppleBlox, Bloxstrap, etc.)
     scan_bootstrapper_configs(&mut findings);
 
+    // 3. Check cheat-tool configs (FFlagToolkit, etc.) separately — these
+    //    are NOT legitimate launchers and their mere presence is Suspicious
+    //    regardless of whether the config file contains anything flaggable.
+    scan_tool_configs(&mut findings);
+
     if findings.is_empty() {
-        findings.push(ScanFinding::new(
-            "client_settings_scanner",
-            ScanVerdict::Clean,
-            "No FFlag override files found — no ClientAppSettings.json or bootstrapper configs detected",
-            None,
-        ));
+        // Distinguish "we checked the standard paths and nothing was there"
+        // from "we could not resolve any path to check at all". A signed
+        // Clean report based on zero-coverage is a silent false-negative;
+        // Inconclusive is honest about what happened.
+        let had_any_root = !get_client_settings_paths().is_empty()
+            || !get_bootstrapper_config_paths().is_empty();
+        if had_any_root {
+            findings.push(ScanFinding::new(
+                "client_settings_scanner",
+                ScanVerdict::Clean,
+                "No FFlag override files found at standard paths",
+                None,
+            ));
+        } else {
+            findings.push(ScanFinding::new(
+                "client_settings_scanner",
+                ScanVerdict::Inconclusive,
+                "Could not resolve any ClientSettings / bootstrapper paths — environment variables (LOCALAPPDATA / APPDATA / HOME) may be unset",
+                None,
+            ));
+        }
     }
 
     findings
@@ -97,9 +119,13 @@ fn check_flat_json_flags(content: &str, path: &PathBuf, findings: &mut Vec<ScanF
     let parsed: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(e) => {
+            // Unparseable JSON is an environmental condition (mid-write race,
+            // BOM, JSONC comments, truncation) not cheat evidence. The
+            // bootstrapper side already treated this as non-cheat; emit the
+            // same verdict here for symmetry.
             findings.push(ScanFinding::new(
                 "client_settings_scanner",
-                ScanVerdict::Suspicious,
+                ScanVerdict::Inconclusive,
                 format!("Could not parse JSON: {}", e),
                 Some(format!("Path: {}", path.display())),
             ));
@@ -154,24 +180,40 @@ fn check_flat_json_flags(content: &str, path: &PathBuf, findings: &mut Vec<ScanF
                 ));
             }
             ScanVerdict::Clean => {
-                // get_flag_severity returns Clean for both LOW-tier known flags
-                // and truly-unknown flags. Distinguish the two so operators see
-                // an accurate label and (where available) the description.
+                // LOW-tier documented flags and truly-unknown flag-shaped
+                // keys are NOT Suspicious. LOW is by definition benign (the
+                // severity enum returned Clean for them). Unknown keys may
+                // be Roblox flags added after this scanner's data snapshot
+                // — the user is punished for the scanner's age if we call
+                // them Suspicious. v0.4.10 demoted the memory-scanner
+                // summary to Clean; do the same here for parity.
                 if get_flag_category(key).is_some() {
                     findings.push(ScanFinding::new(
                         "client_settings_scanner",
-                        ScanVerdict::Suspicious,
+                        ScanVerdict::Clean,
                         format!("Low-severity FFlag detected: \"{}\" = {}", key, value),
                         Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
                     ));
                 } else {
                     findings.push(ScanFinding::new(
                         "client_settings_scanner",
-                        ScanVerdict::Suspicious,
-                        format!("Unknown non-allowlisted FFlag: \"{}\" = {}", key, value),
+                        ScanVerdict::Clean,
+                        format!("Unrecognized FFlag-shaped override (not in local DB): \"{}\" = {}", key, value),
                         Some(format!("Path: {}", path.display())),
                     ));
                 }
+            }
+            ScanVerdict::Inconclusive => {
+                // The severity lookup never returns Inconclusive today, but
+                // keep this arm so adding a new tier later doesn't
+                // accidentally fall through to a catchall. Treat it like
+                // Clean for now.
+                findings.push(ScanFinding::new(
+                    "client_settings_scanner",
+                    ScanVerdict::Inconclusive,
+                    format!("FFlag requires operator review: \"{}\" = {}", key, value),
+                    Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
+                ));
             }
         }
     }
@@ -198,7 +240,7 @@ fn scan_bootstrapper_configs(findings: &mut Vec<ScanFinding>) {
                 Err(_) => {
                     findings.push(ScanFinding::new(
                         "client_settings_scanner",
-                        ScanVerdict::Clean,
+                        ScanVerdict::Inconclusive,
                         format!("{} configuration found (unreadable)", bootstrapper_name),
                         Some(format!("Path: {}", path.display())),
                     ));
@@ -211,7 +253,7 @@ fn scan_bootstrapper_configs(findings: &mut Vec<ScanFinding>) {
                 Err(_) => {
                     findings.push(ScanFinding::new(
                         "client_settings_scanner",
-                        ScanVerdict::Clean,
+                        ScanVerdict::Inconclusive,
                         format!("{} configuration found (unparseable)", bootstrapper_name),
                         Some(format!("Path: {}", path.display())),
                     ));
@@ -316,6 +358,15 @@ fn check_bootstrapper_flag_array(
             None => continue,
         };
 
+        // Skip entries whose `flag` value isn't actually a Roblox FFlag-
+        // shaped identifier. AppleBlox's schema permits arbitrary strings
+        // and users occasionally type non-flag names here — without this
+        // guard the AppleBlox path would emit "Non-allowlisted FFlag" on
+        // gibberish.
+        if !looks_like_fflag_key(flag_name) {
+            continue;
+        }
+
         let enabled = flag_obj
             .get("enabled")
             .and_then(|e| e.as_bool())
@@ -371,10 +422,15 @@ fn check_bootstrapper_flag_array(
                 ));
             }
             ScanVerdict::Clean => {
+                // Same parity fix as check_flat_json_flags: LOW-tier
+                // documented flags and unrecognized flag-shaped keys do
+                // NOT warrant Suspicious. Emit Clean informational so
+                // operators can see the override existed without the
+                // verdict going yellow.
                 if get_flag_category(flag_name).is_some() {
                     findings.push(ScanFinding::new(
                         "client_settings_scanner",
-                        ScanVerdict::Suspicious,
+                        ScanVerdict::Clean,
                         format!(
                             "{}: Low-severity FFlag \"{}\" = {}",
                             bootstrapper_name, flag_name, value
@@ -384,14 +440,25 @@ fn check_bootstrapper_flag_array(
                 } else {
                     findings.push(ScanFinding::new(
                         "client_settings_scanner",
-                        ScanVerdict::Suspicious,
+                        ScanVerdict::Clean,
                         format!(
-                            "{}: Non-allowlisted FFlag \"{}\" = {}",
+                            "{}: Unrecognized FFlag-shaped override \"{}\" = {}",
                             bootstrapper_name, flag_name, value
                         ),
                         Some(format!("Path: {}", path.display())),
                     ));
                 }
+            }
+            ScanVerdict::Inconclusive => {
+                findings.push(ScanFinding::new(
+                    "client_settings_scanner",
+                    ScanVerdict::Inconclusive,
+                    format!(
+                        "{}: FFlag requires operator review \"{}\" = {}",
+                        bootstrapper_name, flag_name, value
+                    ),
+                    Some(format!("Path: {} | Category: {}{}", path.display(), category, detail_suffix)),
+                ));
             }
         }
     }
@@ -447,6 +514,68 @@ fn get_client_settings_paths() -> Vec<PathBuf> {
     }
 
     paths
+}
+
+/// Scan configs belonging to Roblox-specific cheat tools. Their presence on
+/// disk is itself evidence of intent — even an empty config file means the
+/// tool was installed. Emits Suspicious baseline regardless of contents,
+/// and elevates to Flagged if the contents contain a CRITICAL flag.
+fn scan_tool_configs(findings: &mut Vec<ScanFinding>) {
+    for (tool_name, paths) in get_tool_config_paths() {
+        for path in paths {
+            if !path.exists() {
+                continue;
+            }
+
+            // Baseline Suspicious for the presence of a cheat-tool config.
+            findings.push(ScanFinding::new(
+                "client_settings_scanner",
+                ScanVerdict::Suspicious,
+                format!(
+                    "{} tool configuration present on disk (not a legitimate launcher)",
+                    tool_name
+                ),
+                Some(format!("Path: {}", path.display())),
+            ));
+
+            // If contents are parseable JSON with FFlag-style keys, run the
+            // normal flag scan — a critical flag will escalate to Flagged.
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if !content.trim().is_empty() {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(obj) = parsed.as_object() {
+                            let has_fflags = obj.keys().any(|k| looks_like_fflag_key(k));
+                            if has_fflags {
+                                check_flat_json_flags(&content, &path, findings);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Paths to known cheat-tool configuration files. Keep this list disjoint
+/// from `get_bootstrapper_config_paths` — tools get Suspicious baseline,
+/// bootstrappers get informational Clean baseline.
+fn get_tool_config_paths() -> Vec<(&'static str, Vec<PathBuf>)> {
+    #[allow(unused_mut)]
+    let mut configs: Vec<(&'static str, Vec<PathBuf>)> = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let fftoolkit_config = PathBuf::from(&appdata)
+                .join("FFlagToolkit")
+                .join("fflag.json");
+            if fftoolkit_config.exists() {
+                configs.push(("FFlagToolkit", vec![fftoolkit_config]));
+            }
+        }
+    }
+
+    configs
 }
 
 /// Get bootstrapper config file paths for all known bootstrappers.
@@ -521,15 +650,9 @@ fn get_bootstrapper_config_paths() -> Vec<(&'static str, Vec<PathBuf>)> {
             }
         }
 
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            // FFlagToolkit (fflag-injector)
-            let fftoolkit_config = PathBuf::from(&appdata)
-                .join("FFlagToolkit")
-                .join("fflag.json");
-            if fftoolkit_config.exists() {
-                configs.push(("FFlagToolkit", vec![fftoolkit_config]));
-            }
-        }
+        // FFlagToolkit was previously routed here and got the "legitimate
+        // launcher" label — it is in fact a Roblox-cheat tool per
+        // known_tools.rs. Routing moved to get_tool_config_paths.
     }
 
     configs

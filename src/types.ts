@@ -1,4 +1,4 @@
-export type ScanVerdict = "Clean" | "Suspicious" | "Flagged";
+export type ScanVerdict = "Clean" | "Inconclusive" | "Suspicious" | "Flagged";
 
 export interface ScanFinding {
   module: string;

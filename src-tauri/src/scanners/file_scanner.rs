@@ -6,8 +6,8 @@ use walkdir::WalkDir;
 use sha2::{Digest, Sha256};
 
 use crate::data::known_tools::{
-    INJECTOR_SIBLING_CONFIG_FILES, KNOWN_BOOTSTRAPPER_DIRS, KNOWN_TOOL_DIRS, KNOWN_TOOL_FILENAMES,
-    KNOWN_TOOL_HASHES,
+    GENERIC_RE_TOOL_DIRS, INJECTOR_SIBLING_CONFIG_FILES, KNOWN_BOOTSTRAPPER_DIRS,
+    KNOWN_TOOL_FILENAMES, KNOWN_TOOL_HASHES, ROBLOX_CHEAT_DIRS,
 };
 use crate::models::{ScanFinding, ScanVerdict};
 
@@ -32,8 +32,8 @@ pub async fn scan() -> Vec<ScanFinding> {
             continue;
         }
 
-        // Tool directories
-        for &tool_dir in KNOWN_TOOL_DIRS {
+        // Roblox-specific cheat tool directories → Suspicious.
+        for &tool_dir in ROBLOX_CHEAT_DIRS {
             let dir_path = root.join(tool_dir);
             if dir_path.exists() && dir_path.is_dir() {
                 let canon = dir_path.canonicalize().unwrap_or_else(|_| dir_path.clone());
@@ -42,7 +42,34 @@ pub async fn scan() -> Vec<ScanFinding> {
                     findings.push(ScanFinding::new(
                         "file_scanner",
                         ScanVerdict::Suspicious,
-                        format!("Known tool directory found: \"{}\"", tool_dir),
+                        format!("Roblox-cheat tool directory found: \"{}\"", tool_dir),
+                        Some(format!(
+                            "Path: {}, Last modified: {}",
+                            dir_path.display(),
+                            modified
+                        )),
+                    ));
+                }
+            }
+        }
+
+        // Generic reverse-engineering / debugging tools (x64dbg, HxD,
+        // ProcessHacker, etc.) — widely used for CTF, malware analysis,
+        // driver debugging, and security research. Record as informational
+        // Clean notes only; do not raise the verdict.
+        for &tool_dir in GENERIC_RE_TOOL_DIRS {
+            let dir_path = root.join(tool_dir);
+            if dir_path.exists() && dir_path.is_dir() {
+                let canon = dir_path.canonicalize().unwrap_or_else(|_| dir_path.clone());
+                if reported_paths.insert(canon.clone()) {
+                    let modified = format_modified(&dir_path);
+                    findings.push(ScanFinding::new(
+                        "file_scanner",
+                        ScanVerdict::Clean,
+                        format!(
+                            "Generic reverse-engineering tool present: \"{}\" (legitimate security/CTF use; not a Roblox-specific cheat indicator)",
+                            tool_dir
+                        ),
                         Some(format!(
                             "Path: {}, Last modified: {}",
                             dir_path.display(),
@@ -156,13 +183,23 @@ pub async fn scan() -> Vec<ScanFinding> {
             }
 
             // Sibling-config heuristic: PE with fflags.json + address.json next
-            // to it is the LornoFix family's on-disk layout.
+            // to it is the LornoFix family's on-disk layout. This is a
+            // filename heuristic with no content verification, so it is
+            // Suspicious — not Flagged. A real PE-magic check plus non-empty
+            // JSON shape keeps it from firing on zero-byte stubs named the
+            // same way in a developer's scratch folder.
             if lower_ext(entry.path()).as_deref() == Some("exe") {
                 if let Some(parent) = entry.path().parent() {
                     let all_present = INJECTOR_SIBLING_CONFIG_FILES
                         .iter()
                         .all(|name| parent.join(name).is_file());
-                    if all_present {
+                    let exe_looks_real = file_starts_with_mz(entry.path());
+                    let siblings_non_empty = INJECTOR_SIBLING_CONFIG_FILES.iter().all(|name| {
+                        std::fs::metadata(parent.join(name))
+                            .map(|m| m.len() >= 2) // enough to hold at least "{}"
+                            .unwrap_or(false)
+                    });
+                    if all_present && exe_looks_real && siblings_non_empty {
                         let canon = entry
                             .path()
                             .canonicalize()
@@ -170,7 +207,7 @@ pub async fn scan() -> Vec<ScanFinding> {
                         if reported_paths.insert(canon.clone()) {
                             findings.push(ScanFinding::new(
                                 "file_scanner",
-                                ScanVerdict::Flagged,
+                                ScanVerdict::Suspicious,
                                 format!(
                                     "Executable co-located with FFlag-injector config files: \"{}\"",
                                     file_name
@@ -194,12 +231,31 @@ pub async fn scan() -> Vec<ScanFinding> {
             .filter(|r| r.exists())
             .map(|r| r.display().to_string())
             .collect();
-        findings.push(ScanFinding::new(
-            "file_scanner",
-            ScanVerdict::Clean,
-            "No known tool artifacts found on filesystem",
-            Some(format!("Scanned {} directories", scanned.len())),
-        ));
+        // Zero roots = zero coverage. A signed Clean report in that case is
+        // a silent false-negative — emit Inconclusive so tournament staff
+        // know the file scan had nothing to look at.
+        if scanned.is_empty() {
+            findings.push(ScanFinding::new(
+                "file_scanner",
+                ScanVerdict::Inconclusive,
+                "No scanner roots available — user home / AppData env vars unset?",
+                Some(format!(
+                    "Configured candidate roots: {}",
+                    roots
+                        .iter()
+                        .map(|r| r.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            ));
+        } else {
+            findings.push(ScanFinding::new(
+                "file_scanner",
+                ScanVerdict::Clean,
+                "No known tool artifacts found on filesystem",
+                Some(format!("Scanned {} directories", scanned.len())),
+            ));
+        }
     }
 
     findings
@@ -225,6 +281,22 @@ fn hash_file_sha256(path: &Path) -> Option<String> {
         }
     }
     Some(hex::encode(hasher.finalize()))
+}
+
+/// True if the file at `path` starts with the PE / Mach-O magic bytes that a
+/// real Windows/macOS executable would have. Prevents the sibling-config
+/// heuristic from firing on a zero-byte or text-only file that happens to be
+/// named `something.exe`.
+fn file_starts_with_mz(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 2];
+    match f.read(&mut magic) {
+        Ok(n) if n == 2 => &magic == b"MZ",
+        _ => false,
+    }
 }
 
 fn format_modified(path: &std::path::Path) -> String {
