@@ -560,16 +560,6 @@ mod windows_impl {
         max_name * 2 + 4
     }
 
-    /// `HANDLE` is a raw pointer (`*mut c_void`) and therefore neither `Send`
-    /// nor `Sync` by default. Windows guarantees that handles obtained via
-    /// `OpenProcess` are safe to use concurrently from multiple threads, so
-    /// we wrap it in a newtype and assert those markers manually. Scoped to
-    /// the per-scan parallel fan-out only.
-    #[derive(Copy, Clone)]
-    struct HandleWrapper(HANDLE);
-    unsafe impl Send for HandleWrapper {}
-    unsafe impl Sync for HandleWrapper {}
-
     /// Read every chunk of a single committed region into `scratch` and feed
     /// it to `scan_buffer`, updating the worker-local `FlagHitTable` and the
     /// shared atomic counters. Checks `timed_out` between chunks so the
@@ -810,7 +800,16 @@ mod windows_impl {
             }
         });
 
-        let hw = HandleWrapper(handle.0);
+        // Pass the HANDLE as a `usize` bit-pattern across thread boundaries.
+        // `HANDLE` is `*mut c_void`, which is neither `Send` nor `Sync`, and
+        // rayon's closure must be both. A wrapper struct with
+        // `unsafe impl Sync` doesn't help here because Rust's disjoint-field
+        // capture rules make the closure capture `&*mut c_void` directly
+        // rather than `&Wrapper`. `usize` is unconditionally `Send + Sync`
+        // and round-trips losslessly back to `HANDLE` inside the closure.
+        // ReadProcessMemory is documented as safe to call concurrently on
+        // the same handle, and `ScopedHandle` only closes after this block.
+        let handle_usize = handle.0 as usize;
         let table = regions_to_scan
             .par_iter()
             .fold(
@@ -820,7 +819,7 @@ mod windows_impl {
                         scan_region_into(
                             &mut local,
                             &mut scratch,
-                            hw.0,
+                            handle_usize as HANDLE,
                             addr,
                             size,
                             overlap,

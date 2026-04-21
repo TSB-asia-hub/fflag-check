@@ -1,7 +1,7 @@
 {
   "name": "tsbcc-fflag-scanner",
   "private": true,
-  "version": "0.4.3",
+  "version": "0.4.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
