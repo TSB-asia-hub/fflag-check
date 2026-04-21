@@ -63,7 +63,12 @@ pub static MEMORY_BASELINE_FLAGS: &[&str] = &[
     "DFIntPhysicsSenderMaxBandwidthBps",
     "DFIntRaycastMaxDistance",
     "DFIntReplicatorAnimationTrackLimitPerAnimator",
-    "DFIntS2PhysicsSenderRate",
+    // DFIntS2PhysicsSenderRate deliberately NOT baselined — it is the
+    // canonical desync / fake-lag override, and even seeing the name
+    // resident in memory is worth surfacing because a memory-only
+    // injector (LornoFix-class) never touches a config file. A small
+    // number of vanilla-process false positives is a tolerable cost to
+    // keep detection of the #1 flag in the suspicious database.
     "DFIntSimAdaptiveHumanoidPDControllerSubstepMultiplier",
     "DFIntTimestepArbiterHumanoidTurningVelThreshold",
     "FFlagProcessAnimationLooped",
@@ -142,12 +147,22 @@ mod tests {
     #[test]
     fn memory_baseline_covers_tsb_sample() {
         // Sanity: if anyone re-sorts or accidentally deletes entries from
-        // MEMORY_BASELINE_FLAGS, the next memory scan starts firing on
-        // DFIntS2PhysicsSenderRate again — a finding that noise-floods
-        // the UI on every normal Roblox run. Pin a sample of each tier.
-        assert!(is_memory_baseline_flag("DFIntS2PhysicsSenderRate"));
+        // MEMORY_BASELINE_FLAGS, TSB-common flag names start firing again
+        // and flood the UI on every vanilla Roblox run. Pin one sample
+        // from each of the three tiers the baseline draws from.
+        assert!(is_memory_baseline_flag("DFIntMaxActiveAnimationTracks"));
         assert!(is_memory_baseline_flag("FFlagUnifiedLightingBetaFeature"));
         assert!(is_memory_baseline_flag("FLogNetwork"));
+    }
+
+    #[test]
+    fn canonical_desync_flag_is_not_baselined() {
+        // Non-negotiable: DFIntS2PhysicsSenderRate is the #1 desync /
+        // fake-lag override. It must NEVER end up in the memory baseline,
+        // even as we grow the TSB-common list, because a memory-resident
+        // injector (LornoFix-class) only ever touches process memory and
+        // this is our only line of defence against it.
+        assert!(!is_memory_baseline_flag("DFIntS2PhysicsSenderRate"));
     }
 
     #[test]
