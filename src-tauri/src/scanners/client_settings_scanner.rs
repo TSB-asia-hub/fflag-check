@@ -4,6 +4,20 @@ use crate::data::flag_allowlist::is_allowed_flag;
 use crate::data::suspicious_flags::{get_flag_category, get_flag_description, get_flag_severity};
 use crate::models::{ScanFinding, ScanVerdict};
 
+/// The set of identifier prefixes every real Roblox FFlag starts with. A
+/// JSON key that doesn't match one of these is not a flag override at all
+/// — it's unrelated configuration data, and treating it as a "suspicious
+/// flag" would be a false positive. Kept in sync with the memory scanner's
+/// FLAG_PREFIXES.
+const FFLAG_KEY_PREFIXES: &[&str] = &[
+    "FFlag", "DFFlag", "DFInt", "FInt", "DFString", "FString", "DFLog", "FLog", "SFFlag", "SFInt",
+    "SFString",
+];
+
+fn looks_like_fflag_key(key: &str) -> bool {
+    FFLAG_KEY_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
 /// Scan Roblox ClientAppSettings.json and bootstrapper configs for suspicious FFlags.
 pub async fn scan() -> Vec<ScanFinding> {
     let mut findings = Vec::new();
@@ -16,11 +30,18 @@ pub async fn scan() -> Vec<ScanFinding> {
         }
 
         let before = findings.len();
-        let parse_failed;
+        let mut parse_failed = false;
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                check_flat_json_flags(&content, path, &mut findings);
-                parse_failed = false;
+                // An empty or whitespace-only file is equivalent to `{}` —
+                // Bloxstrap / Fishstrap write stub ClientAppSettings.json
+                // files when the user has no FFlag overrides set, and
+                // those should not produce a parse-failure Suspicious
+                // finding. Only attempt JSON parse when there's real
+                // content to parse.
+                if !content.trim().is_empty() {
+                    check_flat_json_flags(&content, path, &mut findings);
+                }
             }
             Err(e) => {
                 findings.push(ScanFinding::new(
@@ -96,6 +117,14 @@ fn check_flat_json_flags(content: &str, path: &PathBuf, findings: &mut Vec<ScanF
     }
 
     for (key, value) in map {
+        // Only identifiers with a real FFlag prefix are treated as flag
+        // overrides. Non-FFlag keys in a ClientAppSettings.json — e.g.
+        // launcher metadata accidentally written into the same file — are
+        // not flags, so we should not emit "Unknown non-allowlisted FFlag"
+        // findings for them.
+        if !looks_like_fflag_key(key) {
+            continue;
+        }
         if is_allowed_flag(key) {
             continue;
         }

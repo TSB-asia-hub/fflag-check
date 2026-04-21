@@ -31,10 +31,18 @@ impl ScanFinding {
         description: impl Into<String>,
         details: Option<String>,
     ) -> Self {
+        // Redact user-home segments in every finding string before it
+        // hangs off the ScanFinding. Descriptions rarely include paths,
+        // but do occasionally (e.g. process exe paths), and details are
+        // where the leakage risk actually lives. Applying here keeps the
+        // per-scanner formatters short and guarantees no scanner can
+        // accidentally publish the user's real name.
+        let description = crate::util::redact_user_paths(&description.into());
+        let details = details.map(|d| crate::util::redact_user_paths(&d));
         Self {
             module: module.into(),
             verdict,
-            description: description.into(),
+            description,
             details,
             timestamp: Utc::now(),
         }

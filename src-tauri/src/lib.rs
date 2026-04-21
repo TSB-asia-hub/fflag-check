@@ -3,6 +3,7 @@ mod scanners;
 mod reports;
 mod data;
 mod commands;
+mod util;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
