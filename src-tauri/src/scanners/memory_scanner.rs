@@ -2,9 +2,7 @@
 // exercised by the Windows path or the unit tests. Silence dead_code there.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-use crate::data::flag_allowlist::{
-    is_allowed_flag, is_memory_baseline_flag, is_memory_soft_finding,
-};
+use crate::data::flag_allowlist::{is_allowed_flag, is_memory_baseline_flag};
 use crate::data::suspicious_flags::{
     get_flag_category, get_flag_description, get_flag_severity, CRITICAL_FLAGS, HIGH_FLAGS,
     MEDIUM_FLAGS,
@@ -58,6 +56,11 @@ struct FlagHit {
     seen_wide: bool,
     /// True if at least one occurrence was found as plain ASCII/UTF-8.
     seen_ascii: bool,
+    /// Best-effort literal value captured from bytes adjacent to the first
+    /// match — typically `"FlagName":123` or `"FlagName":"str"`. None if no
+    /// JSON-like context could be parsed. Used to surface the *override
+    /// value* to the operator instead of just the flag name.
+    sample_value: Option<String>,
 }
 
 /// Per-scan hit map. Keys are interned flag names (static strings for known
@@ -69,6 +72,16 @@ struct FlagHitTable {
 
 impl FlagHitTable {
     fn record(&mut self, flag: &str, address: usize, wide: bool) {
+        self.record_with_value(flag, address, wide, None)
+    }
+
+    fn record_with_value(
+        &mut self,
+        flag: &str,
+        address: usize,
+        wide: bool,
+        value: Option<String>,
+    ) {
         let entry = self.hits.entry(flag.to_string()).or_default();
         if entry.count == 0 {
             entry.first_address = address;
@@ -78,6 +91,14 @@ impl FlagHitTable {
             entry.seen_wide = true;
         } else {
             entry.seen_ascii = true;
+        }
+        // Keep the FIRST captured value. Roblox's own heap usually has the
+        // name as a bare C string with no adjacent JSON value, so a later
+        // injector-style match provides better signal — but the first hit
+        // is also commonly the real one. Prefer whatever we saw first and
+        // don't overwrite, to keep output deterministic.
+        if entry.sample_value.is_none() {
+            entry.sample_value = value;
         }
     }
     fn total_flags(&self) -> usize {
@@ -99,6 +120,9 @@ impl FlagHitTable {
                     existing.count = existing.count.saturating_add(h.count);
                     existing.seen_wide |= h.seen_wide;
                     existing.seen_ascii |= h.seen_ascii;
+                    if existing.sample_value.is_none() {
+                        existing.sample_value = h.sample_value;
+                    }
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
                     v.insert(h);
@@ -252,6 +276,118 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Longest value literal we'll surface in a finding. Strings longer than
+/// this are truncated with a trailing "…" — the point is evidence for the
+/// operator, not a full dump of an adjacent memory region.
+const MAX_VALUE_CAPTURE_BYTES: usize = 64;
+
+/// Attempt to extract a JSON-style value that immediately follows a flag
+/// NAME match in ASCII bytes. Expected shapes (after skipping the closing
+/// quote and the `:` separator):
+///   "FlagName":1234
+///   "FlagName":"literal"
+///   "FlagName":true | false
+///   "FlagName":null
+/// Returns `None` if no such context is present (e.g. the name is a bare
+/// C string in Roblox's flag registry with no adjacent JSON value).
+fn extract_adjacent_value_ascii(buffer: &[u8], match_end: usize) -> Option<String> {
+    // Skip over an optional closing quote `"` after the name — we accept
+    // both `"Foo":1` and `Foo:1` shapes because some memory layouts store
+    // interned keys without quotes.
+    let mut i = match_end;
+    if i < buffer.len() && buffer[i] == b'"' {
+        i += 1;
+    }
+    // Skip whitespace up to the `:`.
+    while i < buffer.len() && matches!(buffer[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i >= buffer.len() || buffer[i] != b':' {
+        return None;
+    }
+    i += 1;
+    while i < buffer.len() && matches!(buffer[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i >= buffer.len() {
+        return None;
+    }
+
+    let start = i;
+    match buffer[i] {
+        // Quoted string: read up to the next unescaped quote.
+        b'"' => {
+            i += 1;
+            let str_start = i;
+            while i < buffer.len()
+                && i - str_start < MAX_VALUE_CAPTURE_BYTES
+                && buffer[i] != b'"'
+                && buffer[i] != 0
+            {
+                i += 1;
+            }
+            let body = &buffer[str_start..i];
+            let s = std::str::from_utf8(body).ok()?;
+            let truncated = i - str_start >= MAX_VALUE_CAPTURE_BYTES;
+            Some(if truncated {
+                format!("\"{}…\"", s)
+            } else {
+                format!("\"{}\"", s)
+            })
+        }
+        // Number: int / float / leading sign.
+        b'-' | b'0'..=b'9' => {
+            i += 1;
+            while i < buffer.len()
+                && i - start < MAX_VALUE_CAPTURE_BYTES
+                && (buffer[i].is_ascii_digit() || matches!(buffer[i], b'.' | b'e' | b'E' | b'+' | b'-'))
+            {
+                i += 1;
+            }
+            std::str::from_utf8(&buffer[start..i]).ok().map(str::to_owned)
+        }
+        // true / false / null — peek up to 5 bytes and check.
+        b't' | b'f' | b'n' => {
+            let end = (start + 5).min(buffer.len());
+            let slice = &buffer[start..end];
+            if slice.starts_with(b"true") {
+                Some("true".to_string())
+            } else if slice.starts_with(b"false") {
+                Some("false".to_string())
+            } else if slice.starts_with(b"null") {
+                Some("null".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Wide (UTF-16LE) variant of `extract_adjacent_value_ascii`. We handle the
+/// common case where the override looks like `F\x00l\x00a\x00g\x00"\x00:\x00`
+/// followed by either another wide string or a wide-encoded digit run.
+fn extract_adjacent_value_wide(buffer: &[u8], match_end: usize) -> Option<String> {
+    // Decode up to MAX_VALUE_CAPTURE_BYTES wide chars into a scratch string
+    // and then parse it with the ASCII extractor. This avoids duplicating
+    // all of the JSON shape logic.
+    let mut i = match_end;
+    let mut ascii: Vec<u8> = Vec::with_capacity(MAX_VALUE_CAPTURE_BYTES + 8);
+    while i + 1 < buffer.len() && ascii.len() < MAX_VALUE_CAPTURE_BYTES + 8 {
+        let lo = buffer[i];
+        let hi = buffer[i + 1];
+        // Only copy bytes that look like genuine wide-encoded ASCII — a
+        // non-zero high byte means the code unit is non-ASCII, which
+        // terminates our capture window.
+        if hi != 0 {
+            break;
+        }
+        ascii.push(lo);
+        i += 2;
+    }
+    extract_adjacent_value_ascii(&ascii, 0)
+}
+
 /// Cached set of every known suspicious flag name, for O(1) lookups from
 /// the hot ASCII-scan loop. Before this cache each candidate triggered three
 /// linear scans over the CRITICAL/HIGH/MEDIUM arrays (~300 string compares
@@ -403,7 +539,8 @@ fn scan_wide_known(buffer: &[u8], base_address: usize, table: &mut FlagHitTable)
         }
         let name = names[m.pattern().as_usize()];
         let address = base_address.saturating_add(start);
-        table.record(name, address, true);
+        let value = extract_adjacent_value_wide(buffer, start + len);
+        table.record_with_value(name, address, true, value);
     }
 }
 
@@ -446,7 +583,9 @@ fn scan_buffer(buffer: &[u8], base_address: usize, table: &mut FlagHitTable) {
     // ASCII generic prefix scan — captures known AND unknown flags.
     for (offset, name, _is_known) in scan_prefix_hits(buffer) {
         let address = base_address.saturating_add(offset);
-        table.record(&name, address, false);
+        let match_end = offset + name.len();
+        let value = extract_adjacent_value_ascii(buffer, match_end);
+        table.record_with_value(&name, address, false, value);
     }
     // UTF-16LE targeted scan for known names.
     scan_wide_known(buffer, base_address, table);
@@ -506,10 +645,9 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
         if is_memory_baseline_flag(name) {
             continue;
         }
-        let is_soft = is_memory_soft_finding(name);
         let is_known = known.contains(name.as_str());
 
-        if !is_known && !is_soft {
+        if !is_known {
             // Truly unrecognized name — goes into the grouped baseline
             // summary below.
             unknown_count += 1;
@@ -523,31 +661,23 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
             continue;
         }
 
-        // Soft-listed TSB-community names cap their verdict at Suspicious
-        // regardless of whatever CRITICAL/HIGH/MEDIUM tier they live in in
-        // the suspicious database. The cap is memory-scanner-only; the
-        // client_settings scanner still uses the full tier.
-        let verdict = if is_soft {
-            ScanVerdict::Suspicious
-        } else {
-            get_flag_severity(name)
+        // Value-proximity gate: memory hits without a JSON-shaped value
+        // next to the name are almost always Roblox's runtime referencing
+        // its own flag registry, not a user-written override. Skip them.
+        // Real memory-written overrides (LornoFix class, WriteProcessMemory
+        // injectors, and any injector that writes a serialized config into
+        // heap) land as "\"FlagName\":value" byte sequences which the
+        // extractor captures. This is the core v0.5.2 false-positive fix.
+        let value = match &hit.sample_value {
+            Some(v) => v.clone(),
+            None => continue,
         };
-        let category = if is_soft {
-            "TSB_COMMON"
-        } else {
-            get_flag_category(name).unwrap_or("KNOWN")
-        };
-        // Only surface the suspicious-db description when we're surfacing
-        // at that flag's real tier. For soft findings the description
-        // would lead with language like "classic desync override", which
-        // oversells what's actually an ambiguous memory-only signal.
-        let desc_suffix = if is_soft {
-            String::new()
-        } else {
-            get_flag_description(name)
-                .map(|d| format!(" | {}", d))
-                .unwrap_or_default()
-        };
+
+        let verdict = get_flag_severity(name);
+        let category = get_flag_category(name).unwrap_or("KNOWN");
+        let desc_suffix = get_flag_description(name)
+            .map(|d| format!(" | {}", d))
+            .unwrap_or_default();
         let encoding = match (hit.seen_ascii, hit.seen_wide) {
             (true, true) => "ascii+utf16",
             (true, false) => "ascii",
@@ -555,22 +685,15 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
             (false, false) => "unknown",
         };
 
-        let msg = if is_soft {
-            format!(
-                "FFlag observed in Roblox memory (TSB-common, ambiguous): \"{}\"",
-                name
-            )
-        } else {
-            format!("FFlag found in Roblox memory: \"{}\"", name)
-        };
+        let msg = format!("FFlag override found in Roblox memory: \"{}\" = {}", name, value);
 
         out.push(ScanFinding::new(
             "memory_scanner",
             verdict,
             msg,
             Some(format!(
-                "First address: 0x{:X} | Occurrences: {} | Encoding: {} | Category: {}{}",
-                hit.first_address, hit.count, encoding, category, desc_suffix
+                "Value: {} | First address: 0x{:X} | Occurrences: {} | Encoding: {} | Category: {}{}",
+                value, hit.first_address, hit.count, encoding, category, desc_suffix
             )),
         ));
     }

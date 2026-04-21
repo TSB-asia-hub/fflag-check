@@ -128,74 +128,32 @@ pub static MEMORY_BASELINE_FLAGS: &[&str] = &[
     "FFlagEnableReportAbuseMenuRoactABTest2",
 ];
 
-/// TSB-community ambiguous flags. Commonly observed in The Strongest
-/// Battlegrounds player memory across both vanilla and modified clients;
-/// we can't disambiguate "Roblox-internal registry reference" from
-/// "injector wrote this" at the name level. Emit as Suspicious (yellow)
-/// rather than the full CRITICAL/HIGH/MEDIUM severity the suspicious_flags
-/// database assigns, so tournament staff still see an inspectable row but
-/// the overall scan verdict doesn't go red purely from a shared community
-/// pattern.
+/// Historically held "ambiguous" TSB-community flag names that fired
+/// Suspicious in memory. v0.5.1 retired the soft-findings concept: the
+/// memory scanner cannot distinguish "Roblox's runtime loaded this name
+/// into its registry" from "an injector wrote this override" at the NAME
+/// level (only VALUES would differ, and the memory scanner does not
+/// capture adjacent values). Every entry that used to live here now lives
+/// in MEMORY_BASELINE_FLAGS and is silenced from the memory scan.
 ///
-/// Only the memory scanner consults this list. If one of these names
-/// appears in a local ClientAppSettings.json or bootstrapper config, the
-/// client_settings scanner still flags it at full severity — actively
-/// writing the value is a real override regardless of how common the name
-/// is in heap.
+/// ClientSettings scanning remains the authoritative path: if a user
+/// actually writes an override into ClientAppSettings.json or a
+/// bootstrapper config, the client_settings scanner flags the value at
+/// full CRITICAL/HIGH/MEDIUM severity.
 ///
-/// DFIntS2PhysicsSenderRate is deliberately NOT on this list: it is the
-/// canonical desync / fake-lag override and must retain its Flagged
-/// severity in memory as well as in config files.
-pub static MEMORY_SOFT_FINDINGS: &[&str] = &[
-    // Names that MAY be injector-written OR Roblox-internal — not confident
-    // enough either way to silence outright (that's MEMORY_BASELINE_FLAGS)
-    // nor flag at full severity. Cap to Suspicious and keep an inspectable
-    // row for tournament staff.
-    //
-    // Entries that have since been proven to be Roblox-shipped registry
-    // names were moved to MEMORY_BASELINE_FLAGS; do not re-add them here.
-    //
-    // ---- Physics / replication engine defaults ----
-    "DFIntBulletContactBreakOrthogonalThresholdPercent",
-    "DFIntBulletContactBreakThresholdPercent",
-    "DFIntDebugDefaultTargetWorldStepsPerFrame",
-    "DFIntGameNetLocalSpaceMaxSendIndex",
-    "DFIntGameNetPVHeaderRotationalVelocityZeroCutoffExponent",
-    "DFIntMaxActiveAnimationTracks",
-    "DFIntMaxMissedWorldStepsRemembered",
-    "DFIntMinimalSimRadiusBuffer",
-    "DFIntPhysicsSenderMaxBandwidthBps",
-    "DFIntRaycastMaxDistance",
-    "DFIntReplicatorAnimationTrackLimitPerAnimator",
-    "DFIntSimAdaptiveHumanoidPDControllerSubstepMultiplier",
-    "DFIntTimestepArbiterHumanoidTurningVelThreshold",
-    "FFlagProcessAnimationLooped",
-    "FFlagRemapAnimationR6ToR15Rig",
-    "FFlagSimAdaptiveTimesteppingDefault2",
-    // ---- Rendering engine defaults ----
-    "DFFlagDebugDrawEnable",
-    "DFIntPerformanceControlTextureQualityBestUtility",
-    "DFIntTextureCompositorActiveJobs",
-    "FIntCameraFarZPlane",
-    "FIntCameraMaxZoomDistance",
-    "FIntMaxCameraMaxZoomDistance",
-    "FIntScrollWheelDeltaAmount",
-    "FIntTextureCompositorLowResFactor",
-    "FStringTerrainMaterialTable2022",
-    "FStringTerrainMaterialTablePre2022",
-    // ---- Assorted engine internals ----
-    "DFFlagOrder66",
-    "DFFlagUseVisBugChecks",
-    "DFIntCSGv2LodsToGenerate",
-    "DFIntDebugSimPhysicsSteppingMethodOverride",
-    "DFIntRaknetBandwidthPingSendEveryXSeconds",
-    "FIntFullscreenTitleBarTriggerDelayMillis",
-    "FIntRuntimeMaxNumOfThreads",
-    "FIntTaskSchedulerThreadMin",
-];
+/// The canonical memory-only exception is `DFIntS2PhysicsSenderRate`,
+/// which stays off both lists so the memory scanner can still catch the
+/// classic desync injector family that writes directly via
+/// WriteProcessMemory. See the pin test below.
+#[allow(dead_code)]
+pub static MEMORY_SOFT_FINDINGS: &[&str] = &[];
 
 /// True if this flag name is an ambiguous TSB-community memory finding
 /// whose severity should be capped at Suspicious when seen in memory.
+/// Retained for the retirement pin test — the memory scanner itself no
+/// longer consults this list, see the value-proximity gate in
+/// `scanners::memory_scanner::findings_from_table`.
+#[allow(dead_code)]
 pub fn is_memory_soft_finding(flag_name: &str) -> bool {
     MEMORY_SOFT_FINDINGS.iter().any(|&f| f == flag_name)
 }
@@ -248,28 +206,33 @@ mod tests {
     }
 
     #[test]
-    fn memory_soft_findings_cover_tsb_sample() {
-        // Pin canonical ambiguous names so a cleanup accidentally removing
-        // an entry fails CI. Genuinely-shipped names belong in
-        // MEMORY_BASELINE_FLAGS, not here.
-        assert!(is_memory_soft_finding("DFIntMaxActiveAnimationTracks"));
-        assert!(is_memory_soft_finding("FFlagSimAdaptiveTimesteppingDefault2"));
-        assert!(is_memory_soft_finding("DFIntMinimalSimRadiusBuffer"));
+    fn memory_soft_findings_is_retired() {
+        // The soft-findings concept was retired in v0.5.1 because the
+        // memory scanner cannot distinguish runtime-registry presence from
+        // injector presence at the name level. Baseline silences; the
+        // canonical desync flag remains off both lists.
+        assert!(MEMORY_SOFT_FINDINGS.is_empty());
     }
 
     #[test]
-    fn memory_soft_and_baseline_are_disjoint() {
-        // Baseline silences entirely; soft demotes to Suspicious. A name on
-        // both is ambiguous signalling — baseline wins in findings_from_table
-        // but the redundancy makes the soft list misleading. Keep them
-        // disjoint.
-        for &soft in MEMORY_SOFT_FINDINGS {
+    fn engine_default_names_are_not_blanket_silenced() {
+        // v0.5.2 reverses the v0.5.1 blanket silence on physics/engine
+        // names: the memory scanner now requires value-proximity evidence
+        // before emitting, which kills the FP without dropping the ability
+        // to detect real memory-only injections. Keep these names OFF the
+        // baseline so a value-carrying override still surfaces.
+        for &name in [
+            "DFIntBulletContactBreakOrthogonalThresholdPercent",
+            "DFIntMinimalSimRadiusBuffer",
+            "FFlagSimAdaptiveTimesteppingDefault2",
+            "FIntCameraFarZPlane",
+        ]
+        .iter()
+        {
             assert!(
-                !MEMORY_BASELINE_FLAGS.contains(&soft),
-                "{} is on both MEMORY_SOFT_FINDINGS and MEMORY_BASELINE_FLAGS; \
-                 if it is Roblox-shipped, remove from soft findings — baseline \
-                 silences it",
-                soft
+                !is_memory_baseline_flag(name),
+                "{} must be detectable (with value) — not on baseline",
+                name
             );
         }
     }
