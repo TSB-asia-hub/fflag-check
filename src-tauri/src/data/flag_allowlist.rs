@@ -35,85 +35,24 @@ pub fn is_allowed_flag(flag_name: &str) -> bool {
     ALLOWED_FLAGS.iter().any(|&f| f == flag_name)
 }
 
-/// Memory-scan baseline. FFlag NAMES that are present in virtually every
-/// real Roblox process because the runtime/game server references them in
-/// the internal flag table — the memory scanner finding the string in
-/// heap memory is not evidence of a client-side exploit, just that Roblox
-/// knows about the flag.
+/// Memory-scan baseline: flag names whose mere presence in Roblox process
+/// memory is known-not-interesting and should be suppressed from findings.
 ///
-/// Critically, this list is NOT consulted by the client_settings scanner.
-/// If a player actively writes one of these names into a local
-/// ClientAppSettings.json or a bootstrapper config, that is still an
-/// override worth surfacing — the desync / physics-manipulation risk
-/// attaches to the *value* being set, not the name being mentioned.
+/// HISTORY: an earlier draft here listed ~54 flags sampled from TSB (The
+/// Strongest Battlegrounds) players under the assumption that they were
+/// Roblox-internal registry entries present on every vanilla client. That
+/// was wrong — the shared set was the fingerprint of the TSB community's
+/// shared FFlag injector. Baselining them silenced the exact evidence
+/// the memory scanner is supposed to surface. The list was removed in
+/// v0.4.11.
 ///
-/// Curated from operator sampling across TSB (The Strongest Battlegrounds)
-/// players on 2026-04-21. Names observed on every sampled vanilla client
-/// regardless of whether the player was exploiting.
-pub static MEMORY_BASELINE_FLAGS: &[&str] = &[
-    // ---- Previously CRITICAL tier (17) ----
-    "DFIntBulletContactBreakOrthogonalThresholdPercent",
-    "DFIntBulletContactBreakThresholdPercent",
-    "DFIntDebugDefaultTargetWorldStepsPerFrame",
-    "DFIntGameNetLocalSpaceMaxSendIndex",
-    "DFIntGameNetPVHeaderRotationalVelocityZeroCutoffExponent",
-    "DFIntMaxActiveAnimationTracks",
-    "DFIntMaxMissedWorldStepsRemembered",
-    "DFIntMinimalSimRadiusBuffer",
-    "DFIntPhysicsSenderMaxBandwidthBps",
-    "DFIntRaycastMaxDistance",
-    "DFIntReplicatorAnimationTrackLimitPerAnimator",
-    // DFIntS2PhysicsSenderRate deliberately NOT baselined — it is the
-    // canonical desync / fake-lag override, and even seeing the name
-    // resident in memory is worth surfacing because a memory-only
-    // injector (LornoFix-class) never touches a config file. A small
-    // number of vanilla-process false positives is a tolerable cost to
-    // keep detection of the #1 flag in the suspicious database.
-    "DFIntSimAdaptiveHumanoidPDControllerSubstepMultiplier",
-    "DFIntTimestepArbiterHumanoidTurningVelThreshold",
-    "FFlagProcessAnimationLooped",
-    "FFlagRemapAnimationR6ToR15Rig",
-    "FFlagSimAdaptiveTimesteppingDefault2",
-    // ---- Previously HIGH tier (15) ----
-    "DFFlagDebugDrawEnable",
-    "DFIntCanHideGuiGroupId",
-    "DFIntPerformanceControlTextureQualityBestUtility",
-    "DFIntTextureCompositorActiveJobs",
-    "FFlagDataModelPatcherForceLocal",
-    "FFlagGuiHidingApiSupport2",
-    "FFlagUnifiedLightingBetaFeature",
-    "FFlagUserShowGuiHideToggles",
-    "FIntCameraFarZPlane",
-    "FIntCameraMaxZoomDistance",
-    "FIntMaxCameraMaxZoomDistance",
-    "FIntScrollWheelDeltaAmount",
-    "FIntTextureCompositorLowResFactor",
-    "FStringTerrainMaterialTable2022",
-    "FStringTerrainMaterialTablePre2022",
-    // ---- Previously MEDIUM tier (22) ----
-    "DFFlagOrder66",
-    "DFFlagUseVisBugChecks",
-    "DFIntCSGv2LodsToGenerate",
-    "DFIntDebugSimPhysicsSteppingMethodOverride",
-    "DFIntRaknetBandwidthPingSendEveryXSeconds",
-    "FFlagAdServiceEnabled",
-    "FFlagControlBetaBadgeWithGuac",
-    "FFlagEnableBubbleChatFromChatService",
-    "FFlagEnableInGameMenuChromeABTest4",
-    "FFlagEnableInGameMenuSongbirdABTest",
-    "FFlagFastGPULightCulling3",
-    "FFlagGameBasicSettingsFramerateCap5",
-    "FFlagRenderDebugCheckThreading2",
-    "FFlagRenderFixGrassPrepass",
-    "FFlagRenderNoLowFrmBloom",
-    "FFlagRigScaleShouldAffectAnimations",
-    "FFlagTaskSchedulerLimitTargetFpsTo2402",
-    "FFlagTopBarUseNewBadge",
-    "FIntFullscreenTitleBarTriggerDelayMillis",
-    "FIntRuntimeMaxNumOfThreads",
-    "FIntTaskSchedulerThreadMin",
-    "FLogNetwork",
-];
+/// The array is kept (empty) instead of deleted so the suppression hook
+/// remains available if a future investigation identifies a flag that is
+/// genuinely Roblox-internal AND is a high-volume false positive. Any
+/// addition here needs a paired justification in the commit message.
+///
+/// This list is NOT consulted by the client_settings scanner.
+pub static MEMORY_BASELINE_FLAGS: &[&str] = &[];
 
 /// True if this flag name is a memory-scanner baseline — i.e. its presence
 /// in process memory is not on its own suspicious.
@@ -145,23 +84,23 @@ mod tests {
     }
 
     #[test]
-    fn memory_baseline_covers_tsb_sample() {
-        // Sanity: if anyone re-sorts or accidentally deletes entries from
-        // MEMORY_BASELINE_FLAGS, TSB-common flag names start firing again
-        // and flood the UI on every vanilla Roblox run. Pin one sample
-        // from each of the three tiers the baseline draws from.
-        assert!(is_memory_baseline_flag("DFIntMaxActiveAnimationTracks"));
-        assert!(is_memory_baseline_flag("FFlagUnifiedLightingBetaFeature"));
-        assert!(is_memory_baseline_flag("FLogNetwork"));
+    fn memory_baseline_is_empty_by_default() {
+        // The old ~54-entry TSB baseline was a mistake: the flags sampled
+        // as "common across TSB players" were actually the TSB injector's
+        // own fingerprint, so baselining them silenced the detector. The
+        // array is kept in the module but empty; any future addition has
+        // to come with a justification in the commit log (see the
+        // MEMORY_BASELINE_FLAGS doc comment).
+        assert!(MEMORY_BASELINE_FLAGS.is_empty());
     }
 
     #[test]
     fn canonical_desync_flag_is_not_baselined() {
         // Non-negotiable: DFIntS2PhysicsSenderRate is the #1 desync /
-        // fake-lag override. It must NEVER end up in the memory baseline,
-        // even as we grow the TSB-common list, because a memory-resident
-        // injector (LornoFix-class) only ever touches process memory and
-        // this is our only line of defence against it.
+        // fake-lag override. Even if the baseline grows again, this flag
+        // must never be silenced — memory-only injectors (LornoFix class)
+        // never touch a config file, so the memory scan is our only line
+        // of defence against them.
         assert!(!is_memory_baseline_flag("DFIntS2PhysicsSenderRate"));
     }
 
