@@ -92,14 +92,32 @@ pub async fn scan() -> Vec<ScanFinding> {
         // from "we could not resolve any path to check at all". A signed
         // Clean report based on zero-coverage is a silent false-negative;
         // Inconclusive is honest about what happened.
-        let had_any_root = !get_client_settings_paths().is_empty()
-            || !get_bootstrapper_config_paths().is_empty();
+        let client_paths = get_client_settings_paths();
+        let bootstrapper_paths = get_bootstrapper_config_paths();
+        let had_any_root = !client_paths.is_empty() || !bootstrapper_paths.is_empty();
+        // Build a concise list of paths we DID check — if the user has an
+        // override file at a non-standard path, this is the diagnostic
+        // that tells tournament staff (and us) where to look next.
+        let mut checked: Vec<String> = client_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        for (name, paths) in &bootstrapper_paths {
+            for p in paths {
+                checked.push(format!("{} config: {}", name, p.display()));
+            }
+        }
+        let detail = if checked.is_empty() {
+            None
+        } else {
+            Some(format!("Checked paths: {}", checked.join(" | ")))
+        };
         if had_any_root {
             findings.push(ScanFinding::new(
                 "client_settings_scanner",
                 ScanVerdict::Clean,
                 "No FFlag override files found at standard paths",
-                None,
+                detail,
             ));
         } else {
             findings.push(ScanFinding::new(
@@ -496,17 +514,44 @@ fn get_client_settings_paths() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         // Native macOS Roblox stores ClientAppSettings inside the .app bundle
-        // (per https://devforum.roblox.com/t/3180597). The legacy
-        // ~/Library/Roblox/ClientSettings path is also kept as a fallback.
+        // (per https://devforum.roblox.com/t/3180597). The user creates the
+        // ClientSettings directory themselves after installing — this is
+        // THE most common path for non-bootstrapper overrides on macOS.
         paths.push(PathBuf::from(
             "/Applications/Roblox.app/Contents/MacOS/ClientSettings/ClientAppSettings.json",
         ));
+        // Resources-side variant occasionally referenced in old guides.
+        paths.push(PathBuf::from(
+            "/Applications/Roblox.app/Contents/Resources/ClientSettings/ClientAppSettings.json",
+        ));
         if let Ok(home) = std::env::var("HOME") {
             let home_path = PathBuf::from(&home);
+            // Legacy ~/Library/Roblox path from pre-2020 Roblox Mac client.
             paths.push(
                 home_path
                     .join("Library")
                     .join("Roblox")
+                    .join("ClientSettings")
+                    .join("ClientAppSettings.json"),
+            );
+            // User-installed Roblox.app (Launchpad can place it here).
+            paths.push(
+                home_path
+                    .join("Applications")
+                    .join("Roblox.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("ClientSettings")
+                    .join("ClientAppSettings.json"),
+            );
+            // Mac App Store sandboxed container.
+            paths.push(
+                home_path
+                    .join("Library")
+                    .join("Containers")
+                    .join("com.roblox.roblox")
+                    .join("Data")
+                    .join("Documents")
                     .join("ClientSettings")
                     .join("ClientAppSettings.json"),
             );

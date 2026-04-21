@@ -2,11 +2,8 @@
 // exercised by the Windows path or the unit tests. Silence dead_code there.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-use crate::data::flag_allowlist::{is_allowed_flag, is_memory_baseline_flag};
-use crate::data::suspicious_flags::{
-    get_flag_category, get_flag_description, get_flag_severity, CRITICAL_FLAGS, HIGH_FLAGS,
-    MEDIUM_FLAGS,
-};
+use crate::data::flag_allowlist::is_allowed_flag;
+use crate::data::suspicious_flags::{CRITICAL_FLAGS, HIGH_FLAGS, MEDIUM_FLAGS};
 use crate::models::{ScanFinding, ScanVerdict};
 use crate::scanners::progress::ScanProgress;
 use std::collections::{HashMap, HashSet};
@@ -593,150 +590,106 @@ fn scan_buffer(buffer: &[u8], base_address: usize, table: &mut FlagHitTable) {
 
 /// Emit findings from the hit table.
 ///
-/// Known suspicious flags (Critical / High / Medium) each get their own
-/// individual finding — these are actionable and the user needs to see them
-/// one per row.
+/// Build scan findings from the aggregated hit table.
 ///
-/// Unrecognized flag-shaped identifiers are folded into a single summary
-/// finding with a sampled list in the details. Roblox's running process
-/// contains thousands of internal identifiers matching the FFlag shape;
-/// emitting a finding per unknown hit would push tens of thousands of rows
-/// into the UI, hanging the webview. The summary still surfaces the count
-/// and top-N names so a reviewer can spot anomalous additions without
-/// drowning in noise.
+/// v0.5.2: Memory-side flag NAME matching is an unreliable injection
+/// signal and is no longer used to produce Suspicious/Flagged findings.
+///
+/// Why: Roblox's client startup fetches a remote flag config from
+/// Roblox's config endpoint and stores the JSON response in heap. It
+/// also ships internal default flag configurations. Both land as byte
+/// runs of the form `"FlagName":value` — byte-for-byte identical to
+/// what an injector writing a serialized config into heap would
+/// produce. The value-proximity gate shipped in v0.5.1 therefore still
+/// fired on every vanilla client because Roblox's own server response
+/// provides the same shape. Trying to disambiguate at the name/value
+/// level requires reverse-engineering Roblox's flag-loading pipeline,
+/// which shifts across client versions.
+///
+/// Authoritative override-detection paths that replace this:
+///   - `client_settings_scanner`: reads ClientAppSettings.json and
+///     bootstrapper configs directly — the user-writable file is the
+///     real source of truth for file-backed overrides.
+///   - `file_scanner` + `known_tools.rs`: hashes LornoFix / FFlagToolkit
+///     binaries and detects the sibling-config disk layout.
+///   - `process_scanner`: running-process match on known tool names.
+///   - `scan_modules_windows` (same file, above): flags DLLs loaded
+///     into Roblox from untrusted paths — this is how DLL-injection
+///     style cheats are caught.
+///   - The RWX region enumeration in `scan_windows`: PAGE_EXECUTE_READWRITE
+///     pages in the Roblox process surface as Suspicious — that is the
+///     hallmark of runtime code patchers and shellcode loaders.
+///
+/// This function now emits at most ONE Clean-informational finding,
+/// summarizing how many FFlag-shaped identifiers were observed in
+/// heap so the operator has the count for debugging. It never emits
+/// Suspicious or Flagged verdicts — the memory scanner's verdict is
+/// driven solely by RWX / module / environmental signals.
 fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
-    const UNKNOWN_SAMPLE_LIMIT: usize = 25;
-
+    const SAMPLE_LIMIT: usize = 25;
     let mut out = Vec::new();
+    if table.hits.is_empty() {
+        return out;
+    }
 
-    let known = known_flag_set();
     let mut entries: Vec<(&String, &FlagHit)> = table.hits.iter().collect();
-    let severity_rank = |name: &str| -> u8 {
-        if CRITICAL_FLAGS.iter().any(|&f| f == name) {
-            0
-        } else if HIGH_FLAGS.iter().any(|&f| f == name) {
-            1
-        } else if MEDIUM_FLAGS.iter().any(|&f| f == name) {
-            2
-        } else {
-            3
-        }
-    };
-    entries.sort_by(|a, b| {
-        severity_rank(a.0)
-            .cmp(&severity_rank(b.0))
-            .then_with(|| a.0.cmp(b.0))
-    });
+    entries.sort_by(|a, b| a.0.cmp(b.0));
 
-    let mut unknown_count: usize = 0;
-    let mut unknown_total_occurrences: u64 = 0;
-    let mut unknown_seen_wide = false;
-    let mut unknown_seen_ascii = false;
-    let mut unknown_samples: Vec<String> = Vec::new();
+    let mut unique: usize = 0;
+    let mut total_occurrences: u64 = 0;
+    let mut seen_ascii = false;
+    let mut seen_wide = false;
+    let mut samples: Vec<String> = Vec::new();
 
     for (name, hit) in entries {
+        // Allowlisted names don't enter the count at all — Roblox's own
+        // September 2025 allowlist permits them in every configuration
+        // path, so their presence in heap is explicitly sanctioned.
         if is_allowed_flag(name) {
             continue;
         }
-        // Roblox loads its entire FFlag registry (~20k names) into heap at
-        // startup; the mere presence of a baseline-shipped name is zero
-        // evidence of injection. Silence before severity assignment so the
-        // finding never surfaces.
-        if is_memory_baseline_flag(name) {
-            continue;
+        unique += 1;
+        total_occurrences = total_occurrences.saturating_add(hit.count as u64);
+        seen_ascii |= hit.seen_ascii;
+        seen_wide |= hit.seen_wide;
+        if samples.len() < SAMPLE_LIMIT {
+            samples.push(name.clone());
         }
-        let is_known = known.contains(name.as_str());
-
-        if !is_known {
-            // Truly unrecognized name — goes into the grouped baseline
-            // summary below.
-            unknown_count += 1;
-            unknown_total_occurrences =
-                unknown_total_occurrences.saturating_add(hit.count as u64);
-            unknown_seen_wide |= hit.seen_wide;
-            unknown_seen_ascii |= hit.seen_ascii;
-            if unknown_samples.len() < UNKNOWN_SAMPLE_LIMIT {
-                unknown_samples.push(name.clone());
-            }
-            continue;
-        }
-
-        // Value-proximity gate: memory hits without a JSON-shaped value
-        // next to the name are almost always Roblox's runtime referencing
-        // its own flag registry, not a user-written override. Skip them.
-        // Real memory-written overrides (LornoFix class, WriteProcessMemory
-        // injectors, and any injector that writes a serialized config into
-        // heap) land as "\"FlagName\":value" byte sequences which the
-        // extractor captures. This is the core v0.5.2 false-positive fix.
-        let value = match &hit.sample_value {
-            Some(v) => v.clone(),
-            None => continue,
-        };
-
-        let verdict = get_flag_severity(name);
-        let category = get_flag_category(name).unwrap_or("KNOWN");
-        let desc_suffix = get_flag_description(name)
-            .map(|d| format!(" | {}", d))
-            .unwrap_or_default();
-        let encoding = match (hit.seen_ascii, hit.seen_wide) {
-            (true, true) => "ascii+utf16",
-            (true, false) => "ascii",
-            (false, true) => "utf16",
-            (false, false) => "unknown",
-        };
-
-        let msg = format!("FFlag override found in Roblox memory: \"{}\" = {}", name, value);
-
-        out.push(ScanFinding::new(
-            "memory_scanner",
-            verdict,
-            msg,
-            Some(format!(
-                "Value: {} | First address: 0x{:X} | Occurrences: {} | Encoding: {} | Category: {}{}",
-                value, hit.first_address, hit.count, encoding, category, desc_suffix
-            )),
-        ));
     }
 
-    if unknown_count > 0 {
-        let encoding = match (unknown_seen_ascii, unknown_seen_wide) {
-            (true, true) => "ascii+utf16",
-            (true, false) => "ascii",
-            (false, true) => "utf16",
-            (false, false) => "unknown",
-        };
-        let sample_line = if unknown_samples.is_empty() {
-            String::new()
+    if unique == 0 {
+        return out;
+    }
+
+    let encoding = match (seen_ascii, seen_wide) {
+        (true, true) => "ascii+utf16",
+        (true, false) => "ascii",
+        (false, true) => "utf16",
+        (false, false) => "unknown",
+    };
+    let sample_line = if samples.is_empty() {
+        String::new()
+    } else {
+        let truncation = if unique > SAMPLE_LIMIT {
+            format!(" (+{} more)", unique - SAMPLE_LIMIT)
         } else {
-            let sample_names = unknown_samples.join(", ");
-            let truncation = if unknown_count > UNKNOWN_SAMPLE_LIMIT {
-                format!(" (+{} more)", unknown_count - UNKNOWN_SAMPLE_LIMIT)
-            } else {
-                String::new()
-            };
-            format!(" | Samples: {}{}", sample_names, truncation)
+            String::new()
         };
-        // The "unrecognized" label here really means "name is not in the
-        // hand-curated suspicious database" — it does NOT mean the name
-        // is exploit-written. A vanilla Roblox process has ~20k FFlag
-        // names resident in heap because the runtime loads its full flag
-        // registry on startup, so surfacing this as Suspicious trips the
-        // overall scan verdict on every legitimate run. Emit as Clean
-        // (informational) so the count / samples remain inspectable
-        // without polluting the verdict.
-        out.push(ScanFinding::new(
-            "memory_scanner",
-            ScanVerdict::Clean,
-            format!(
-                "{} FFlag-shaped identifiers observed in Roblox memory (baseline registry, no known-suspicious matches)",
-                unknown_count
-            ),
-            Some(format!(
-                "Unique names: {} | Total occurrences: {} | Encoding: {}{}",
-                unknown_count, unknown_total_occurrences, encoding, sample_line
-            )),
-        ));
-    }
+        format!(" | Samples: {}{}", samples.join(", "), truncation)
+    };
+
+    out.push(ScanFinding::new(
+        "memory_scanner",
+        ScanVerdict::Clean,
+        format!(
+            "{} FFlag-shaped identifiers observed in Roblox heap (baseline registry — not a cheat signal). File-backed overrides are detected by the client_settings scanner.",
+            unique
+        ),
+        Some(format!(
+            "Unique names: {} | Total occurrences: {} | Encoding: {}{}",
+            unique, total_occurrences, encoding, sample_line
+        )),
+    ));
 
     out
 }
@@ -1580,6 +1533,41 @@ mod tests {
         match &findings[0].verdict {
             ScanVerdict::Clean => {}
             other => panic!("expected Clean, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn findings_never_emit_suspicious_or_flagged_for_known_names() {
+        // v0.5.2: memory-side flag NAME emission was retired. Even when
+        // a known CRITICAL flag with an adjacent JSON-shaped value lands
+        // in the hit table, `findings_from_table` must NOT emit a
+        // Suspicious or Flagged finding — Roblox's remote flag-config
+        // response provides the same `"Name":value` byte shape in heap
+        // on every vanilla client, so matching there produces
+        // false positives on legitimate players. The authoritative
+        // override-detection path is client_settings_scanner.
+        let mut table = FlagHitTable::default();
+        table.record_with_value(
+            "DFIntS2PhysicsSenderRate",
+            0x1000,
+            false,
+            Some("1".to_string()),
+        );
+        table.record_with_value("FIntCameraFarZPlane", 0x2000, false, Some("1".to_string()));
+        table.record_with_value(
+            "DFIntCSGv2LodsToGenerate",
+            0x3000,
+            false,
+            Some("0".to_string()),
+        );
+        let findings = findings_from_table(&table);
+        for f in &findings {
+            assert!(
+                matches!(f.verdict, ScanVerdict::Clean),
+                "memory scanner must not emit {:?} for known names: {:?}",
+                f.verdict,
+                f
+            );
         }
     }
 

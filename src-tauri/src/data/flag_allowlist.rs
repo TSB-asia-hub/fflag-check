@@ -53,6 +53,14 @@ pub fn is_allowed_flag(flag_name: &str) -> bool {
 /// DFIntS2PhysicsSenderRate is deliberately NOT on this list (see the test
 /// `canonical_desync_flag_stays_at_full_severity`): it is the canonical
 /// memory-only desync override and must retain its Flagged severity.
+///
+/// v0.5.2 note: the memory scanner no longer consults this list because
+/// the name-matching emission was retired (see the findings_from_table
+/// docstring in scanners/memory_scanner.rs). The list is retained so
+/// future scanners that DO want a known-benign baseline can reuse it,
+/// and so the pin tests below keep documenting which names Roblox
+/// itself ships.
+#[allow(dead_code)]
 pub static MEMORY_BASELINE_FLAGS: &[&str] = &[
     // ---- Chrome in-game menu rollout (shipped default on modern clients) ----
     "FFlagEnableInGameMenuChromeABTest2",
@@ -159,7 +167,10 @@ pub fn is_memory_soft_finding(flag_name: &str) -> bool {
 }
 
 /// True if this flag name is a memory-scanner baseline — i.e. its presence
-/// in process memory is not on its own suspicious.
+/// in process memory is not on its own suspicious. Retained for tests and
+/// future reuse; the memory scanner itself no longer consults this list
+/// (v0.5.2 retired the flag-name emission path).
+#[allow(dead_code)]
 pub fn is_memory_baseline_flag(flag_name: &str) -> bool {
     MEMORY_BASELINE_FLAGS.iter().any(|&f| f == flag_name)
 }
