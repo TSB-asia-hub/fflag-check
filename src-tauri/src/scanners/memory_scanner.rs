@@ -2,7 +2,7 @@
 // exercised by the Windows path or the unit tests. Silence dead_code there.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-use crate::data::flag_allowlist::{is_allowed_flag, is_memory_baseline_flag};
+use crate::data::flag_allowlist::{is_allowed_flag, is_memory_soft_finding};
 use crate::data::suspicious_flags::{
     get_flag_category, get_flag_description, get_flag_severity, CRITICAL_FLAGS, HIGH_FLAGS,
     MEDIUM_FLAGS,
@@ -488,18 +488,15 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
     let mut unknown_samples: Vec<String> = Vec::new();
 
     for (name, hit) in entries {
-        if is_allowed_flag(name) || is_memory_baseline_flag(name) {
-            // Skip both Roblox's official allowlist AND the TSB-community
-            // memory baseline. The latter is flags whose NAMES live in
-            // every vanilla Roblox process because the runtime references
-            // them — the string being in memory doesn't mean a value was
-            // ever set. The client_settings scanner handles the value-set
-            // case separately and ignores this baseline.
+        if is_allowed_flag(name) {
             continue;
         }
+        let is_soft = is_memory_soft_finding(name);
         let is_known = known.contains(name.as_str());
 
-        if !is_known {
+        if !is_known && !is_soft {
+            // Truly unrecognized name — goes into the grouped baseline
+            // summary below.
             unknown_count += 1;
             unknown_total_occurrences =
                 unknown_total_occurrences.saturating_add(hit.count as u64);
@@ -511,10 +508,31 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
             continue;
         }
 
-        let verdict = get_flag_severity(name);
-        let category = get_flag_category(name).unwrap_or("KNOWN");
-        let desc = get_flag_description(name);
-        let desc_suffix = desc.map(|d| format!(" | {}", d)).unwrap_or_default();
+        // Soft-listed TSB-community names cap their verdict at Suspicious
+        // regardless of whatever CRITICAL/HIGH/MEDIUM tier they live in in
+        // the suspicious database. The cap is memory-scanner-only; the
+        // client_settings scanner still uses the full tier.
+        let verdict = if is_soft {
+            ScanVerdict::Suspicious
+        } else {
+            get_flag_severity(name)
+        };
+        let category = if is_soft {
+            "TSB_COMMON"
+        } else {
+            get_flag_category(name).unwrap_or("KNOWN")
+        };
+        // Only surface the suspicious-db description when we're surfacing
+        // at that flag's real tier. For soft findings the description
+        // would lead with language like "classic desync override", which
+        // oversells what's actually an ambiguous memory-only signal.
+        let desc_suffix = if is_soft {
+            String::new()
+        } else {
+            get_flag_description(name)
+                .map(|d| format!(" | {}", d))
+                .unwrap_or_default()
+        };
         let encoding = match (hit.seen_ascii, hit.seen_wide) {
             (true, true) => "ascii+utf16",
             (true, false) => "ascii",
@@ -522,10 +540,19 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
             (false, false) => "unknown",
         };
 
+        let msg = if is_soft {
+            format!(
+                "FFlag observed in Roblox memory (TSB-common, ambiguous): \"{}\"",
+                name
+            )
+        } else {
+            format!("FFlag found in Roblox memory: \"{}\"", name)
+        };
+
         out.push(ScanFinding::new(
             "memory_scanner",
             verdict,
-            format!("FFlag found in Roblox memory: \"{}\"", name),
+            msg,
             Some(format!(
                 "First address: 0x{:X} | Occurrences: {} | Encoding: {} | Category: {}{}",
                 hit.first_address, hit.count, encoding, category, desc_suffix

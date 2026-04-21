@@ -37,22 +37,92 @@ pub fn is_allowed_flag(flag_name: &str) -> bool {
 
 /// Memory-scan baseline: flag names whose mere presence in Roblox process
 /// memory is known-not-interesting and should be suppressed from findings.
-///
-/// HISTORY: an earlier draft here listed ~54 flags sampled from TSB (The
-/// Strongest Battlegrounds) players under the assumption that they were
-/// Roblox-internal registry entries present on every vanilla client. That
-/// was wrong — the shared set was the fingerprint of the TSB community's
-/// shared FFlag injector. Baselining them silenced the exact evidence
-/// the memory scanner is supposed to surface. The list was removed in
-/// v0.4.11.
-///
-/// The array is kept (empty) instead of deleted so the suppression hook
-/// remains available if a future investigation identifies a flag that is
-/// genuinely Roblox-internal AND is a high-volume false positive. Any
-/// addition here needs a paired justification in the commit message.
-///
-/// This list is NOT consulted by the client_settings scanner.
+/// Intentionally empty; see the MEMORY_SOFT_FINDINGS list below for the
+/// softer-downgrade mechanism the TSB-common flags now use.
 pub static MEMORY_BASELINE_FLAGS: &[&str] = &[];
+
+/// TSB-community ambiguous flags. Commonly observed in The Strongest
+/// Battlegrounds player memory across both vanilla and modified clients;
+/// we can't disambiguate "Roblox-internal registry reference" from
+/// "injector wrote this" at the name level. Emit as Suspicious (yellow)
+/// rather than the full CRITICAL/HIGH/MEDIUM severity the suspicious_flags
+/// database assigns, so tournament staff still see an inspectable row but
+/// the overall scan verdict doesn't go red purely from a shared community
+/// pattern.
+///
+/// Only the memory scanner consults this list. If one of these names
+/// appears in a local ClientAppSettings.json or bootstrapper config, the
+/// client_settings scanner still flags it at full severity — actively
+/// writing the value is a real override regardless of how common the name
+/// is in heap.
+///
+/// DFIntS2PhysicsSenderRate is deliberately NOT on this list: it is the
+/// canonical desync / fake-lag override and must retain its Flagged
+/// severity in memory as well as in config files.
+pub static MEMORY_SOFT_FINDINGS: &[&str] = &[
+    // ---- Caller-provided "CRITICAL" tier minus DFIntS2PhysicsSenderRate ----
+    "DFIntBulletContactBreakOrthogonalThresholdPercent",
+    "DFIntBulletContactBreakThresholdPercent",
+    "DFIntDebugDefaultTargetWorldStepsPerFrame",
+    "DFIntGameNetLocalSpaceMaxSendIndex",
+    "DFIntGameNetPVHeaderRotationalVelocityZeroCutoffExponent",
+    "DFIntMaxActiveAnimationTracks",
+    "DFIntMaxMissedWorldStepsRemembered",
+    "DFIntMinimalSimRadiusBuffer",
+    "DFIntPhysicsSenderMaxBandwidthBps",
+    "DFIntRaycastMaxDistance",
+    "DFIntReplicatorAnimationTrackLimitPerAnimator",
+    "DFIntSimAdaptiveHumanoidPDControllerSubstepMultiplier",
+    "DFIntTimestepArbiterHumanoidTurningVelThreshold",
+    "FFlagProcessAnimationLooped",
+    "FFlagRemapAnimationR6ToR15Rig",
+    "FFlagSimAdaptiveTimesteppingDefault2",
+    // ---- Caller-provided "HIGH" tier ----
+    "DFFlagDebugDrawEnable",
+    "DFIntCanHideGuiGroupId",
+    "DFIntPerformanceControlTextureQualityBestUtility",
+    "DFIntTextureCompositorActiveJobs",
+    "FFlagDataModelPatcherForceLocal",
+    "FFlagGuiHidingApiSupport2",
+    "FFlagUnifiedLightingBetaFeature",
+    "FFlagUserShowGuiHideToggles",
+    "FIntCameraFarZPlane",
+    "FIntCameraMaxZoomDistance",
+    "FIntMaxCameraMaxZoomDistance",
+    "FIntScrollWheelDeltaAmount",
+    "FIntTextureCompositorLowResFactor",
+    "FStringTerrainMaterialTable2022",
+    "FStringTerrainMaterialTablePre2022",
+    // ---- Caller-provided "MEDIUM" tier ----
+    "DFFlagOrder66",
+    "DFFlagUseVisBugChecks",
+    "DFIntCSGv2LodsToGenerate",
+    "DFIntDebugSimPhysicsSteppingMethodOverride",
+    "DFIntRaknetBandwidthPingSendEveryXSeconds",
+    "FFlagAdServiceEnabled",
+    "FFlagControlBetaBadgeWithGuac",
+    "FFlagEnableBubbleChatFromChatService",
+    "FFlagEnableInGameMenuChromeABTest4",
+    "FFlagEnableInGameMenuSongbirdABTest",
+    "FFlagFastGPULightCulling3",
+    "FFlagGameBasicSettingsFramerateCap5",
+    "FFlagRenderDebugCheckThreading2",
+    "FFlagRenderFixGrassPrepass",
+    "FFlagRenderNoLowFrmBloom",
+    "FFlagRigScaleShouldAffectAnimations",
+    "FFlagTaskSchedulerLimitTargetFpsTo2402",
+    "FFlagTopBarUseNewBadge",
+    "FIntFullscreenTitleBarTriggerDelayMillis",
+    "FIntRuntimeMaxNumOfThreads",
+    "FIntTaskSchedulerThreadMin",
+    "FLogNetwork",
+];
+
+/// True if this flag name is an ambiguous TSB-community memory finding
+/// whose severity should be capped at Suspicious when seen in memory.
+pub fn is_memory_soft_finding(flag_name: &str) -> bool {
+    MEMORY_SOFT_FINDINGS.iter().any(|&f| f == flag_name)
+}
 
 /// True if this flag name is a memory-scanner baseline — i.e. its presence
 /// in process memory is not on its own suspicious.
@@ -84,38 +154,44 @@ mod tests {
     }
 
     #[test]
-    fn memory_baseline_is_empty_by_default() {
-        // The old ~54-entry TSB baseline was a mistake: the flags sampled
-        // as "common across TSB players" were actually the TSB injector's
-        // own fingerprint, so baselining them silenced the detector. The
-        // array is kept in the module but empty; any future addition has
-        // to come with a justification in the commit log (see the
-        // MEMORY_BASELINE_FLAGS doc comment).
+    fn memory_baseline_stays_empty() {
+        // The full-suppression baseline is reserved for future flags that
+        // are proven Roblox-internal AND high-volume false positives. The
+        // TSB-common list uses MEMORY_SOFT_FINDINGS instead, which fires
+        // at Suspicious severity rather than silencing.
         assert!(MEMORY_BASELINE_FLAGS.is_empty());
     }
 
     #[test]
-    fn canonical_desync_flag_is_not_baselined() {
-        // Non-negotiable: DFIntS2PhysicsSenderRate is the #1 desync /
-        // fake-lag override. Even if the baseline grows again, this flag
-        // must never be silenced — memory-only injectors (LornoFix class)
-        // never touch a config file, so the memory scan is our only line
-        // of defence against them.
-        assert!(!is_memory_baseline_flag("DFIntS2PhysicsSenderRate"));
+    fn memory_soft_findings_cover_tsb_sample() {
+        // Pin one sample per tier the soft list draws from so a cleanup
+        // accidentally removing an entry fails CI.
+        assert!(is_memory_soft_finding("DFIntMaxActiveAnimationTracks"));
+        assert!(is_memory_soft_finding("FFlagUnifiedLightingBetaFeature"));
+        assert!(is_memory_soft_finding("FLogNetwork"));
     }
 
     #[test]
-    fn memory_baseline_does_not_leak_into_config_allowlist() {
-        // MEMORY_BASELINE_FLAGS must NOT be in ALLOWED_FLAGS. The memory
-        // baseline suppresses memory-scan noise only — config-file
-        // scanning still treats these as real overrides, because a user
-        // writing DFIntS2PhysicsSenderRate into a ClientAppSettings.json
-        // is an exploit regardless of Roblox also referencing the name.
-        for &baseline in MEMORY_BASELINE_FLAGS {
+    fn canonical_desync_flag_stays_at_full_severity() {
+        // Non-negotiable: DFIntS2PhysicsSenderRate is the #1 desync /
+        // fake-lag override. It must never be silenced (baseline) AND
+        // must not be downgraded to Suspicious (soft findings) — keep it
+        // out of both lists so memory-only injectors (LornoFix class) are
+        // still surfaced at Flagged severity.
+        assert!(!MEMORY_BASELINE_FLAGS.contains(&"DFIntS2PhysicsSenderRate"));
+        assert!(!is_memory_soft_finding("DFIntS2PhysicsSenderRate"));
+    }
+
+    #[test]
+    fn memory_soft_findings_do_not_leak_into_official_allowlist() {
+        // Never overlap: a flag on Roblox's official allowlist is not a
+        // finding at all, so it should never also appear in the soft
+        // list.
+        for &soft in MEMORY_SOFT_FINDINGS {
             assert!(
-                !is_allowed_flag(baseline),
-                "{} must not be in the Roblox official allowlist",
-                baseline
+                !is_allowed_flag(soft),
+                "{} is on Roblox's official allowlist; remove from MEMORY_SOFT_FINDINGS",
+                soft
             );
         }
     }
