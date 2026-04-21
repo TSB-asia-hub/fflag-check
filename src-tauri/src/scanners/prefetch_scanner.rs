@@ -40,13 +40,13 @@ async fn scan_windows_prefetch() -> Vec<ScanFinding> {
     let prefetch_dir = Path::new(r"C:\Windows\Prefetch");
 
     if !prefetch_dir.exists() {
-        // Prefetch disabled (SSD tuners, enterprise GPO) — coverage is
-        // genuinely zero, so surface as Inconclusive rather than silently
-        // contributing nothing.
+        // Prefetch disabled (SSD tuners, enterprise GPO). This is a
+        // user-side preference/config, not cheat evidence — emit Clean
+        // informational so it doesn't drag the overall verdict down.
         findings.push(ScanFinding::new(
             "prefetch_scanner",
-            ScanVerdict::Inconclusive,
-            "Windows Prefetch directory not present — cannot attest on historical tool execution",
+            ScanVerdict::Clean,
+            "Windows Prefetch directory not present (Prefetch disabled) — historical-execution signal unavailable",
             None,
         ));
         return findings;
@@ -54,12 +54,19 @@ async fn scan_windows_prefetch() -> Vec<ScanFinding> {
 
     let entries = match std::fs::read_dir(prefetch_dir) {
         Ok(e) => e,
-        Err(_) => {
+        Err(err) => {
+            // C:\Windows\Prefetch requires elevation on modern Windows
+            // (UAC medium-IL processes cannot read it). The vast majority
+            // of tournament players run the scanner without admin rights,
+            // so this branch fires on nearly every legitimate run. Emit
+            // Clean informational — the user isn't hiding anything by
+            // running as a regular user, and the other scanners (process,
+            // memory, file, client_settings) still cover the live state.
             findings.push(ScanFinding::new(
                 "prefetch_scanner",
-                ScanVerdict::Inconclusive,
-                "Could not read Windows Prefetch directory (permission denied?)",
-                None,
+                ScanVerdict::Clean,
+                "Windows Prefetch scan skipped — requires administrator rights (non-admin users can't read C:\\Windows\\Prefetch). Not cheat evidence; the other scanners still cover the live Roblox session.",
+                Some(format!("Error: {}", err)),
             ));
             return findings;
         }
