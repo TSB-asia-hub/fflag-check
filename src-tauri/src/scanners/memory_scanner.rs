@@ -551,11 +551,19 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
             };
             format!(" | Samples: {}{}", sample_names, truncation)
         };
+        // The "unrecognized" label here really means "name is not in the
+        // hand-curated suspicious database" — it does NOT mean the name
+        // is exploit-written. A vanilla Roblox process has ~20k FFlag
+        // names resident in heap because the runtime loads its full flag
+        // registry on startup, so surfacing this as Suspicious trips the
+        // overall scan verdict on every legitimate run. Emit as Clean
+        // (informational) so the count / samples remain inspectable
+        // without polluting the verdict.
         out.push(ScanFinding::new(
             "memory_scanner",
-            ScanVerdict::Suspicious,
+            ScanVerdict::Clean,
             format!(
-                "{} unrecognized FFlag-shaped identifiers in Roblox memory",
+                "{} FFlag-shaped identifiers observed in Roblox memory (baseline registry, no known-suspicious matches)",
                 unknown_count
             ),
             Some(format!(
@@ -1324,15 +1332,21 @@ mod tests {
     }
 
     #[test]
-    fn findings_report_unknown_as_suspicious() {
+    fn findings_report_unknown_as_clean_informational() {
+        // "Unknown FFlag-shaped identifier" really means "not in our
+        // hand-curated suspicious database" — Roblox itself has tens of
+        // thousands of FFlag names resident in heap on every run, so
+        // surfacing these as Suspicious would trip the scan verdict on
+        // every legitimate client. The grouped summary is emitted as
+        // Clean/informational so count + samples remain inspectable
+        // without polluting the overall verdict.
         let mut table = FlagHitTable::default();
         table.record("FFlagCompletelyUnknownThing", 0x2000, false);
         let findings = findings_from_table(&table);
         assert_eq!(findings.len(), 1);
-        // Verdict should be Suspicious (not Clean, not Flagged).
         match &findings[0].verdict {
-            ScanVerdict::Suspicious => {}
-            other => panic!("expected Suspicious, got {:?}", other),
+            ScanVerdict::Clean => {}
+            other => panic!("expected Clean, got {:?}", other),
         }
     }
 
