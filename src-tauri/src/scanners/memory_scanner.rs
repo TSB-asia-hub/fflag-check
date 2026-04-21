@@ -444,12 +444,25 @@ fn scan_buffer(buffer: &[u8], base_address: usize, table: &mut FlagHitTable) {
     scan_wide_known(buffer, base_address, table);
 }
 
-/// Emit findings from the hit table. Each flag produces one finding, with
-/// severity derived from classification: allowlist → Clean (skipped from
-/// findings), known suspicious → get_flag_severity, unknown → Suspicious.
+/// Emit findings from the hit table.
+///
+/// Known suspicious flags (Critical / High / Medium) each get their own
+/// individual finding — these are actionable and the user needs to see them
+/// one per row.
+///
+/// Unrecognized flag-shaped identifiers are folded into a single summary
+/// finding with a sampled list in the details. Roblox's running process
+/// contains thousands of internal identifiers matching the FFlag shape;
+/// emitting a finding per unknown hit would push tens of thousands of rows
+/// into the UI, hanging the webview. The summary still surfaces the count
+/// and top-N names so a reviewer can spot anomalous additions without
+/// drowning in noise.
 fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
+    const UNKNOWN_SAMPLE_LIMIT: usize = 25;
+
     let mut out = Vec::new();
-    // Sort by descending severity priority then by name, for stable output.
+
+    let known = known_flag_set();
     let mut entries: Vec<(&String, &FlagHit)> = table.hits.iter().collect();
     let severity_rank = |name: &str| -> u8 {
         if CRITICAL_FLAGS.iter().any(|&f| f == name) {
@@ -467,23 +480,33 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
             .cmp(&severity_rank(b.0))
             .then_with(|| a.0.cmp(b.0))
     });
+
+    let mut unknown_count: usize = 0;
+    let mut unknown_total_occurrences: u64 = 0;
+    let mut unknown_seen_wide = false;
+    let mut unknown_seen_ascii = false;
+    let mut unknown_samples: Vec<String> = Vec::new();
+
     for (name, hit) in entries {
         if is_allowed_flag(name) {
-            // Official allowed flags are not a finding — the user is allowed
-            // to set these. Skip.
             continue;
         }
-        let known_critical = CRITICAL_FLAGS.iter().any(|&f| f == name);
-        let known_high = HIGH_FLAGS.iter().any(|&f| f == name);
-        let known_medium = MEDIUM_FLAGS.iter().any(|&f| f == name);
-        let is_known = known_critical || known_high || known_medium;
+        let is_known = known.contains(name.as_str());
 
-        let (verdict, category) = if is_known {
-            (get_flag_severity(name), get_flag_category(name).unwrap_or("KNOWN"))
-        } else {
-            (ScanVerdict::Suspicious, "UNRECOGNIZED")
-        };
+        if !is_known {
+            unknown_count += 1;
+            unknown_total_occurrences =
+                unknown_total_occurrences.saturating_add(hit.count as u64);
+            unknown_seen_wide |= hit.seen_wide;
+            unknown_seen_ascii |= hit.seen_ascii;
+            if unknown_samples.len() < UNKNOWN_SAMPLE_LIMIT {
+                unknown_samples.push(name.clone());
+            }
+            continue;
+        }
 
+        let verdict = get_flag_severity(name);
+        let category = get_flag_category(name).unwrap_or("KNOWN");
         let desc = get_flag_description(name);
         let desc_suffix = desc.map(|d| format!(" | {}", d)).unwrap_or_default();
         let encoding = match (hit.seen_ascii, hit.seen_wide) {
@@ -493,25 +516,49 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
             (false, false) => "unknown",
         };
 
-        let msg = if is_known {
-            format!("FFlag found in Roblox memory: \"{}\"", name)
-        } else {
-            format!(
-                "Unrecognized FFlag-shaped identifier in Roblox memory: \"{}\"",
-                name
-            )
-        };
-
         out.push(ScanFinding::new(
             "memory_scanner",
             verdict,
-            msg,
+            format!("FFlag found in Roblox memory: \"{}\"", name),
             Some(format!(
                 "First address: 0x{:X} | Occurrences: {} | Encoding: {} | Category: {}{}",
                 hit.first_address, hit.count, encoding, category, desc_suffix
             )),
         ));
     }
+
+    if unknown_count > 0 {
+        let encoding = match (unknown_seen_ascii, unknown_seen_wide) {
+            (true, true) => "ascii+utf16",
+            (true, false) => "ascii",
+            (false, true) => "utf16",
+            (false, false) => "unknown",
+        };
+        let sample_line = if unknown_samples.is_empty() {
+            String::new()
+        } else {
+            let sample_names = unknown_samples.join(", ");
+            let truncation = if unknown_count > UNKNOWN_SAMPLE_LIMIT {
+                format!(" (+{} more)", unknown_count - UNKNOWN_SAMPLE_LIMIT)
+            } else {
+                String::new()
+            };
+            format!(" | Samples: {}{}", sample_names, truncation)
+        };
+        out.push(ScanFinding::new(
+            "memory_scanner",
+            ScanVerdict::Suspicious,
+            format!(
+                "{} unrecognized FFlag-shaped identifiers in Roblox memory",
+                unknown_count
+            ),
+            Some(format!(
+                "Unique names: {} | Total occurrences: {} | Encoding: {}{}",
+                unknown_count, unknown_total_occurrences, encoding, sample_line
+            )),
+        ));
+    }
+
     out
 }
 

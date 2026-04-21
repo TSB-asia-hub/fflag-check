@@ -1,4 +1,4 @@
-import { Component, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, type KeyboardEvent as ReactKeyboardEvent, ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ScanFinding, ScanReport, ScanVerdict } from "./types";
@@ -613,46 +613,83 @@ function Workarea({
       {phase === "complete" &&
         findings.map((f) => {
           const key = findingKey(f);
-          const open = openKey === key;
-          const cls = `row row--${f.verdict.toLowerCase()} ${open ? "row--open" : ""}`;
-          // Verdict glyph supplements color so colorblind users still see severity.
-          const glyph =
-            f.verdict === "Flagged" ? "✕" : f.verdict === "Suspicious" ? "▲" : "•";
           return (
-            <div
+            <FindingRow
               key={key}
-              className={cls}
-              role="button"
-              tabIndex={0}
-              aria-expanded={open}
-              aria-label={`${f.verdict} finding from ${f.module}: ${f.description}. Press Enter to ${open ? "collapse" : "expand"}.`}
-              onClick={() => onToggle(key)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  onToggle(key);
-                }
-              }}
-            >
-              <span className="row__bar" aria-hidden="true" />
-              <span className="row__module">{f.module}</span>
-              <span className="row__desc">{f.description}</span>
-              <span className="row__verdict">
-                <span aria-hidden="true">{glyph}</span> {f.verdict.toLowerCase()}
-              </span>
-              <span className="row__time">{shortTime(f.timestamp)}</span>
-              <span className="row__caret" aria-hidden="true">›</span>
-              <div className="row__details">
-                <div className="row__details-inner">
-                  {f.details ?? "No additional details."}
-                </div>
-              </div>
-            </div>
+              rowKey={key}
+              finding={f}
+              open={openKey === key}
+              onToggle={onToggle}
+            />
           );
         })}
     </div>
   );
 }
+
+/* ——————————————————————————————————————————————————————————— */
+
+// Memoized so clicking one row to expand it does not force a re-render of
+// every other row in the list. With the memory scanner now emitting
+// findings for large Roblox processes, finding counts can spike into the
+// hundreds — without this memo the main thread stalls long enough that
+// buttons stop responding.
+type FindingRowProps = {
+  rowKey: string;
+  finding: ScanFinding;
+  open: boolean;
+  onToggle: (key: string) => void;
+};
+
+const FindingRow = memo(function FindingRow({
+  rowKey,
+  finding: f,
+  open,
+  onToggle,
+}: FindingRowProps) {
+  const cls = `row row--${f.verdict.toLowerCase()} ${open ? "row--open" : ""}`;
+  // Verdict glyph supplements color so colorblind users still see severity.
+  const glyph =
+    f.verdict === "Flagged" ? "✕" : f.verdict === "Suspicious" ? "▲" : "•";
+  const handleClick = useCallback(() => onToggle(rowKey), [onToggle, rowKey]);
+  const handleKey = useCallback(
+    (e: ReactKeyboardEvent) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        onToggle(rowKey);
+      }
+    },
+    [onToggle, rowKey],
+  );
+  return (
+    <div
+      className={cls}
+      role="button"
+      tabIndex={0}
+      aria-expanded={open}
+      aria-label={`${f.verdict} finding from ${f.module}: ${f.description}. Press Enter to ${open ? "collapse" : "expand"}.`}
+      onClick={handleClick}
+      onKeyDown={handleKey}
+    >
+      <span className="row__bar" aria-hidden="true" />
+      <span className="row__module">{f.module}</span>
+      <span className="row__desc">{f.description}</span>
+      <span className="row__verdict">
+        <span aria-hidden="true">{glyph}</span> {f.verdict.toLowerCase()}
+      </span>
+      <span className="row__time">{shortTime(f.timestamp)}</span>
+      <span className="row__caret" aria-hidden="true">›</span>
+      <div className="row__details">
+        <div className="row__details-inner">
+          {/* Only render the inner content when open. The outer
+              .row__details box is kept unconditionally so the CSS
+              max-height transition still has something to animate. */}
+          {open ? (f.details ?? "No additional details.") : null}
+        </div>
+      </div>
+    </div>
+  );
+});
 
 /* ——————————————————————————————————————————————————————————— */
 
