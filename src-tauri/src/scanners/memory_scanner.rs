@@ -3,15 +3,18 @@
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use crate::data::flag_allowlist::is_allowed_flag;
-use crate::data::suspicious_flags::{CRITICAL_FLAGS, HIGH_FLAGS, MEDIUM_FLAGS};
+use crate::data::suspicious_flags::{
+    get_flag_category, get_flag_description, get_flag_severity, CRITICAL_FLAGS, HIGH_FLAGS,
+    MEDIUM_FLAGS,
+};
 use crate::models::{ScanFinding, ScanVerdict};
 use crate::scanners::progress::ScanProgress;
 use std::collections::{HashMap, HashSet};
 
 /// Known FFlag prefixes. Any identifier matching `<prefix><IdentBody>` where
-/// the body is a camel-cased identifier is a candidate flag name. We treat
-/// unknown candidates as Suspicious rather than ignoring them, because the
-/// allowlist-only approach misses novel flag names entirely.
+/// the body is a camel-cased identifier is a candidate flag name. Unknown
+/// candidates stay informational unless they also have parsed value evidence
+/// near injector/offset-tool provenance.
 const FLAG_PREFIXES: &[&str] = &[
     "DFFlag", "FFlag", "DFInt", "FInt", "DFString", "FString", "DFLog", "FLog", "SFFlag", "SFInt",
     "SFString",
@@ -30,19 +33,53 @@ const MAX_REGIONS_WALKED: usize = 200_000;
 /// Wall-clock safety cap for the entire memory scan. Without this, a stuck
 /// `ReadProcessMemory` on a pathological region (rare, but observed in
 /// field reports) can hang the UI indefinitely with no recovery path. On
-/// expiry the scan returns a Suspicious "aborted" finding so the user
+/// expiry the scan returns an Inconclusive "aborted" finding so the user
 /// learns coverage was incomplete rather than seeing an infinite spinner.
 const MAX_SCAN_DURATION: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// Max per-chunk read (16 MiB). Regions larger than this are chunked with
-/// an overlap equal to the longest candidate string, so boundary hits are
-/// not missed.
+/// Max per-chunk read (16 MiB). Regions larger than this are chunked with a
+/// replay overlap large enough to preserve injector context and string values
+/// across chunk boundaries.
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Absolute per-region cap. Regions larger than this (>512 MiB) are only
 /// partially scanned (the first ABS_REGION_CAP bytes), with a finding noting
 /// the truncation, to keep total scan time bounded.
 const ABS_REGION_CAP: usize = 512 * 1024 * 1024;
+
+/// Maximum distance between a flag/value pair and injector/offset-tool
+/// provenance strings for the value to be treated as runtime injection
+/// evidence. Kept deliberately small relative to the 16 MiB scan chunk so a
+/// random marker elsewhere in the same heap region does not taint vanilla
+/// Roblox's remote flag-config blob.
+const INJECTOR_CONTEXT_WINDOW_BYTES: usize = 64 * 1024;
+const MAX_VALUE_SAMPLES_PER_FLAG: usize = 8;
+const MAX_MARKER_MATCHES_PER_CHUNK: usize = 4096;
+const MAX_PREFIX_HITS_PER_CHUNK: usize = 4096;
+
+/// Strings carried by common FFlag injectors / offset tools. These are not
+/// verdicts on their own; they only let nearby parsed flag values graduate
+/// from "Roblox heap contains a flag name" to "Roblox heap contains a
+/// serialized injector/config artefact".
+const INJECTOR_TOOL_MARKERS: &[&str] = &[
+    "fflags.json",
+    "address.json",
+    "fflagtoolkit",
+    "fflag_injector",
+    "fflag-manager",
+    "lornofix",
+    "lornobypass",
+    "odessa",
+    "robloxoffsetdumper",
+    "offset_dumper",
+    "writeprocessmemory",
+];
+
+#[derive(Clone, Copy)]
+struct MarkerMatch {
+    name: &'static str,
+    start: usize,
+}
 
 /// Aggregated state for an observed flag name, across all regions in one scan.
 #[derive(Default)]
@@ -55,9 +92,29 @@ struct FlagHit {
     seen_ascii: bool,
     /// Best-effort literal value captured from bytes adjacent to the first
     /// match — typically `"FlagName":123` or `"FlagName":"str"`. None if no
-    /// JSON-like context could be parsed. Used to surface the *override
-    /// value* to the operator instead of just the flag name.
-    sample_value: Option<String>,
+    /// JSON-like context could be parsed. We keep several distinct values
+    /// because vanilla Roblox flag payloads and injected override blobs can
+    /// both be resident at once; the first value seen is not necessarily the
+    /// one with evidentiary value.
+    value_samples: Vec<FlagValueSample>,
+}
+
+#[derive(Clone)]
+struct FlagValueSample {
+    value: String,
+    address: usize,
+    wide: bool,
+    context_summary: Option<String>,
+}
+
+/// Aggregated state for high-risk strings that offset-based FFlag injectors
+/// commonly carry alongside their serialized config/address cache. These are
+/// only used in combinations (for example `fflags.json` + `address.json`) so
+/// a single incidental string does not raise the verdict.
+#[derive(Default)]
+struct ToolMarkerHit {
+    count: usize,
+    first_address: usize,
 }
 
 /// Per-scan hit map. Keys are interned flag names (static strings for known
@@ -65,19 +122,17 @@ struct FlagHit {
 #[derive(Default)]
 struct FlagHitTable {
     hits: HashMap<String, FlagHit>,
+    tool_markers: HashMap<&'static str, ToolMarkerHit>,
 }
 
 impl FlagHitTable {
-    fn record(&mut self, flag: &str, address: usize, wide: bool) {
-        self.record_with_value(flag, address, wide, None)
-    }
-
     fn record_with_value(
         &mut self,
         flag: &str,
         address: usize,
         wide: bool,
         value: Option<String>,
+        context_summary: Option<String>,
     ) {
         let entry = self.hits.entry(flag.to_string()).or_default();
         if entry.count == 0 {
@@ -89,15 +144,31 @@ impl FlagHitTable {
         } else {
             entry.seen_ascii = true;
         }
-        // Keep the FIRST captured value. Roblox's own heap usually has the
-        // name as a bare C string with no adjacent JSON value, so a later
-        // injector-style match provides better signal — but the first hit
-        // is also commonly the real one. Prefer whatever we saw first and
-        // don't overwrite, to keep output deterministic.
-        if entry.sample_value.is_none() {
-            entry.sample_value = value;
+        if let Some(value) = value {
+            let injector_context = context_summary.is_some();
+            let already_seen = entry.value_samples.iter().any(|s| {
+                s.value == value && s.wide == wide && s.context_summary == context_summary
+            });
+            if !already_seen {
+                let sample = FlagValueSample {
+                    value,
+                    address,
+                    wide,
+                    context_summary,
+                };
+                push_value_sample(&mut entry.value_samples, sample, injector_context);
+            }
         }
     }
+
+    fn record_tool_marker(&mut self, marker: &'static str, address: usize) {
+        let entry = self.tool_markers.entry(marker).or_default();
+        if entry.count == 0 || address < entry.first_address {
+            entry.first_address = address;
+        }
+        entry.count += 1;
+    }
+
     fn total_flags(&self) -> usize {
         self.hits.len()
     }
@@ -117,9 +188,31 @@ impl FlagHitTable {
                     existing.count = existing.count.saturating_add(h.count);
                     existing.seen_wide |= h.seen_wide;
                     existing.seen_ascii |= h.seen_ascii;
-                    if existing.sample_value.is_none() {
-                        existing.sample_value = h.sample_value;
+                    for sample in h.value_samples {
+                        let has_context = sample.context_summary.is_some();
+                        let already_seen = existing.value_samples.iter().any(|s| {
+                            s.value == sample.value
+                                && s.wide == sample.wide
+                                && s.context_summary == sample.context_summary
+                        });
+                        if !already_seen {
+                            push_value_sample(&mut existing.value_samples, sample, has_context);
+                        }
                     }
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(h);
+                }
+            }
+        }
+        for (marker, h) in other.tool_markers {
+            match self.tool_markers.entry(marker) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let existing = e.get_mut();
+                    if existing.count == 0 || h.first_address < existing.first_address {
+                        existing.first_address = h.first_address;
+                    }
+                    existing.count = existing.count.saturating_add(h.count);
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
                     v.insert(h);
@@ -129,7 +222,28 @@ impl FlagHitTable {
     }
 }
 
+fn push_value_sample(
+    samples: &mut Vec<FlagValueSample>,
+    sample: FlagValueSample,
+    has_context: bool,
+) {
+    if samples.len() < MAX_VALUE_SAMPLES_PER_FLAG {
+        samples.push(sample);
+        return;
+    }
+
+    // Context-backed samples are the only ones that can affect the verdict,
+    // so never let a pile of vanilla remote-config values crowd out the first
+    // useful injector-context value for the same flag.
+    if has_context {
+        if let Some(slot) = samples.iter().position(|s| s.context_summary.is_none()) {
+            samples[slot] = sample;
+        }
+    }
+}
+
 /// Scan Roblox process memory for runtime FFlag injections.
+#[allow(dead_code)]
 pub async fn scan() -> Vec<ScanFinding> {
     scan_with_progress(ScanProgress::noop()).await
 }
@@ -224,7 +338,11 @@ fn is_trusted_roblox_exe_path(exe_path: &str) -> bool {
 /// buffer). This rejects matches that are a prefix/suffix inside a longer
 /// identifier — e.g. searching for `FFlagFoo` must not match `FFlagFooBar`.
 fn is_boundary_ok(buffer: &[u8], start: usize, len: usize) -> bool {
-    let before = if start == 0 { None } else { Some(buffer[start - 1]) };
+    let before = if start == 0 {
+        None
+    } else {
+        Some(buffer[start - 1])
+    };
     let after_idx = start + len;
     let after = if after_idx < buffer.len() {
         Some(buffer[after_idx])
@@ -248,7 +366,11 @@ fn is_contextual_match(buffer: &[u8], start: usize, len: usize) -> bool {
     if !is_boundary_ok(buffer, start, len) {
         return false;
     }
-    let before = if start == 0 { None } else { Some(buffer[start - 1]) };
+    let before = if start == 0 {
+        None
+    } else {
+        Some(buffer[start - 1])
+    };
     let after_idx = start + len;
     let after = if after_idx < buffer.len() {
         Some(buffer[after_idx])
@@ -273,17 +395,22 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+fn is_value_boundary_byte(b: u8) -> bool {
+    b == 0 || b.is_ascii_whitespace() || matches!(b, b',' | b'}' | b']' | b';')
+}
+
 /// Longest value literal we'll surface in a finding. Strings longer than
 /// this are truncated with a trailing "…" — the point is evidence for the
 /// operator, not a full dump of an adjacent memory region.
 const MAX_VALUE_CAPTURE_BYTES: usize = 64;
 
-/// Attempt to extract a JSON-style value that immediately follows a flag
-/// NAME match in ASCII bytes. Expected shapes (after skipping the closing
-/// quote and the `:` separator):
+/// Attempt to extract a JSON/assignment-style value that immediately follows
+/// a flag NAME match in ASCII bytes. Expected shapes (after skipping the
+/// optional closing quote and the `:` / `=` separator):
 ///   "FlagName":1234
 ///   "FlagName":"literal"
 ///   "FlagName":true | false
+///   FlagName=1234
 ///   "FlagName":null
 /// Returns `None` if no such context is present (e.g. the name is a bare
 /// C string in Roblox's flag registry with no adjacent JSON value).
@@ -295,15 +422,15 @@ fn extract_adjacent_value_ascii(buffer: &[u8], match_end: usize) -> Option<Strin
     if i < buffer.len() && buffer[i] == b'"' {
         i += 1;
     }
-    // Skip whitespace up to the `:`.
-    while i < buffer.len() && matches!(buffer[i], b' ' | b'\t') {
+    // Skip whitespace up to the value separator.
+    while i < buffer.len() && buffer[i].is_ascii_whitespace() {
         i += 1;
     }
-    if i >= buffer.len() || buffer[i] != b':' {
+    if i >= buffer.len() || !matches!(buffer[i], b':' | b'=') {
         return None;
     }
     i += 1;
-    while i < buffer.len() && matches!(buffer[i], b' ' | b'\t') {
+    while i < buffer.len() && buffer[i].is_ascii_whitespace() {
         i += 1;
     }
     if i >= buffer.len() {
@@ -316,16 +443,25 @@ fn extract_adjacent_value_ascii(buffer: &[u8], match_end: usize) -> Option<Strin
         b'"' => {
             i += 1;
             let str_start = i;
-            while i < buffer.len()
-                && i - str_start < MAX_VALUE_CAPTURE_BYTES
-                && buffer[i] != b'"'
-                && buffer[i] != 0
-            {
+            let mut escaped = false;
+            while i < buffer.len() && buffer[i] != 0 {
+                if !escaped && buffer[i] == b'"' {
+                    break;
+                }
+                escaped = !escaped && buffer[i] == b'\\';
                 i += 1;
             }
-            let body = &buffer[str_start..i];
+            if i >= buffer.len() || buffer[i] != b'"' {
+                return None;
+            }
+            let after_quote = i + 1;
+            if after_quote < buffer.len() && !is_value_boundary_byte(buffer[after_quote]) {
+                return None;
+            }
+            let captured_end = (str_start + MAX_VALUE_CAPTURE_BYTES).min(i);
+            let body = &buffer[str_start..captured_end];
             let s = std::str::from_utf8(body).ok()?;
-            let truncated = i - str_start >= MAX_VALUE_CAPTURE_BYTES;
+            let truncated = i - str_start > MAX_VALUE_CAPTURE_BYTES;
             Some(if truncated {
                 format!("\"{}…\"", s)
             } else {
@@ -334,24 +470,82 @@ fn extract_adjacent_value_ascii(buffer: &[u8], match_end: usize) -> Option<Strin
         }
         // Number: int / float / leading sign.
         b'-' | b'0'..=b'9' => {
-            i += 1;
+            if buffer[i] == b'-' {
+                i += 1;
+            }
+            let int_start = i;
             while i < buffer.len()
                 && i - start < MAX_VALUE_CAPTURE_BYTES
-                && (buffer[i].is_ascii_digit() || matches!(buffer[i], b'.' | b'e' | b'E' | b'+' | b'-'))
+                && buffer[i].is_ascii_digit()
             {
                 i += 1;
             }
-            std::str::from_utf8(&buffer[start..i]).ok().map(str::to_owned)
+            let mut saw_digit = i > int_start;
+            if i < buffer.len() && i - start < MAX_VALUE_CAPTURE_BYTES && buffer[i] == b'.' {
+                i += 1;
+                let frac_start = i;
+                while i < buffer.len()
+                    && i - start < MAX_VALUE_CAPTURE_BYTES
+                    && buffer[i].is_ascii_digit()
+                {
+                    i += 1;
+                }
+                saw_digit |= i > frac_start;
+            }
+            if !saw_digit {
+                return None;
+            }
+            if i < buffer.len()
+                && i - start < MAX_VALUE_CAPTURE_BYTES
+                && matches!(buffer[i], b'e' | b'E')
+            {
+                let exp_marker = i;
+                i += 1;
+                if i < buffer.len() && matches!(buffer[i], b'+' | b'-') {
+                    i += 1;
+                }
+                let exp_start = i;
+                while i < buffer.len()
+                    && i - start < MAX_VALUE_CAPTURE_BYTES
+                    && buffer[i].is_ascii_digit()
+                {
+                    i += 1;
+                }
+                if i == exp_start {
+                    i = exp_marker;
+                }
+            }
+            if i < buffer.len() && !is_value_boundary_byte(buffer[i]) {
+                return None;
+            }
+            std::str::from_utf8(&buffer[start..i])
+                .ok()
+                .map(str::to_owned)
         }
         // true / false / null — peek up to 5 bytes and check.
         b't' | b'f' | b'n' => {
             let end = (start + 5).min(buffer.len());
             let slice = &buffer[start..end];
-            if slice.starts_with(b"true") {
+            if slice.starts_with(b"true")
+                && buffer
+                    .get(start + 4)
+                    .map(|b| is_value_boundary_byte(*b))
+                    .unwrap_or(true)
+            {
                 Some("true".to_string())
-            } else if slice.starts_with(b"false") {
+            } else if slice.starts_with(b"false")
+                && buffer
+                    .get(start + 5)
+                    .map(|b| is_value_boundary_byte(*b))
+                    .unwrap_or(true)
+            {
                 Some("false".to_string())
-            } else if slice.starts_with(b"null") {
+            } else if slice.starts_with(b"null")
+                && buffer
+                    .get(start + 4)
+                    .map(|b| is_value_boundary_byte(*b))
+                    .unwrap_or(true)
+            {
                 Some("null".to_string())
             } else {
                 None
@@ -393,14 +587,212 @@ fn known_flag_set() -> &'static HashSet<&'static str> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let mut s: HashSet<&'static str> = HashSet::with_capacity(
-            CRITICAL_FLAGS.len() + HIGH_FLAGS.len() + MEDIUM_FLAGS.len(),
-        );
-        s.extend(CRITICAL_FLAGS.iter().copied());
-        s.extend(HIGH_FLAGS.iter().copied());
-        s.extend(MEDIUM_FLAGS.iter().copied());
+        let mut s: HashSet<&'static str> = HashSet::with_capacity(known_suspicious_names().len());
+        s.extend(known_suspicious_names().iter().copied());
         s
     })
+}
+
+fn known_suspicious_names() -> &'static Vec<&'static str> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut names: Vec<&'static str> =
+            Vec::with_capacity(CRITICAL_FLAGS.len() + HIGH_FLAGS.len() + MEDIUM_FLAGS.len());
+        names.extend(CRITICAL_FLAGS.iter().copied());
+        names.extend(HIGH_FLAGS.iter().copied());
+        names.extend(MEDIUM_FLAGS.iter().copied());
+        names
+    })
+}
+
+/// Cached Aho-Corasick automaton over every known suspicious flag name in
+/// ASCII. This catches suspicious DB entries that do not have the standard
+/// FFlag/DFInt prefix (for example `NextGenReplicatorEnabledWrite4`) and lets
+/// known names be collected even when they are NUL-bounded C strings. Verdicts
+/// still require stronger value/provenance evidence later.
+fn known_ascii_automaton() -> &'static (aho_corasick::AhoCorasick, Vec<&'static str>) {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<(aho_corasick::AhoCorasick, Vec<&'static str>)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let names = known_suspicious_names().clone();
+        let ac = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(&names)
+            .expect("aho-corasick automaton build should not fail over static flag set");
+        (ac, names)
+    })
+}
+
+fn tool_marker_ascii_automaton() -> &'static (aho_corasick::AhoCorasick, Vec<&'static str>) {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<(aho_corasick::AhoCorasick, Vec<&'static str>)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let names: Vec<&'static str> = INJECTOR_TOOL_MARKERS.to_vec();
+        let ac = aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(&names)
+            .expect("aho-corasick automaton build should not fail over static marker set");
+        (ac, names)
+    })
+}
+
+fn tool_marker_wide_automaton() -> &'static (aho_corasick::AhoCorasick, Vec<&'static str>) {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<(aho_corasick::AhoCorasick, Vec<&'static str>)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let names: Vec<&'static str> = INJECTOR_TOOL_MARKERS.to_vec();
+        let patterns: Vec<Vec<u8>> = names.iter().map(|n| to_utf16le(n)).collect();
+        let ac = aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(&patterns)
+            .expect("aho-corasick automaton build should not fail over static marker set");
+        (ac, names)
+    })
+}
+
+fn marker_is_config(name: &str) -> bool {
+    name.eq_ignore_ascii_case("fflags.json")
+}
+
+fn marker_is_address_cache(name: &str) -> bool {
+    name.eq_ignore_ascii_case("address.json")
+}
+
+fn marker_is_strong_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fflagtoolkit"
+            | "fflag_injector"
+            | "fflag-manager"
+            | "lornofix"
+            | "lornobypass"
+            | "robloxoffsetdumper"
+            | "offset_dumper"
+    )
+}
+
+fn marker_is_memory_writer(name: &str) -> bool {
+    name.eq_ignore_ascii_case("writeprocessmemory")
+}
+
+fn is_marker_delim(b: u8) -> bool {
+    b == 0
+        || b.is_ascii_whitespace()
+        || matches!(
+            b,
+            b'"' | b'\''
+                | b'\\'
+                | b'/'
+                | b':'
+                | b';'
+                | b','
+                | b'{'
+                | b'}'
+                | b'['
+                | b']'
+                | b'('
+                | b')'
+                | b'='
+        )
+}
+
+fn is_marker_boundary_ok(buffer: &[u8], start: usize, len: usize) -> bool {
+    let before_ok = start == 0 || is_marker_delim(buffer[start - 1]);
+    let after_idx = start + len;
+    let after_ok = after_idx >= buffer.len() || is_marker_delim(buffer[after_idx]);
+    before_ok && after_ok
+}
+
+fn is_wide_marker_boundary_ok(buffer: &[u8], start: usize, len: usize) -> bool {
+    let before_ok = if start >= 2 {
+        let lo = buffer[start - 2];
+        let hi = buffer[start - 1];
+        hi == 0 && is_marker_delim(lo)
+    } else {
+        true
+    };
+    let after = start + len;
+    let after_ok = if after + 1 < buffer.len() {
+        let lo = buffer[after];
+        let hi = buffer[after + 1];
+        hi == 0 && is_marker_delim(lo)
+    } else {
+        true
+    };
+    before_ok && after_ok
+}
+
+fn injector_context_summary_near(markers: &[MarkerMatch], offset: usize) -> Option<String> {
+    let mut has_config = false;
+    let mut has_address_cache = false;
+    let mut has_strong_tool = false;
+    let mut has_writer = false;
+    let mut nearby = Vec::new();
+
+    for marker in markers
+        .iter()
+        .filter(|m| m.start.abs_diff(offset) <= INJECTOR_CONTEXT_WINDOW_BYTES)
+    {
+        has_config |= marker_is_config(marker.name);
+        has_address_cache |= marker_is_address_cache(marker.name);
+        has_strong_tool |= marker_is_strong_tool(marker.name);
+        has_writer |= marker_is_memory_writer(marker.name);
+        if nearby.len() < 8 && !nearby.contains(&marker.name) {
+            nearby.push(marker.name);
+        }
+    }
+
+    let supported = (has_config && has_address_cache)
+        || (has_config && has_writer)
+        || (has_strong_tool && (has_config || has_address_cache || has_writer));
+    if supported {
+        Some(nearby.join(", "))
+    } else {
+        None
+    }
+}
+
+fn scan_tool_markers(
+    buffer: &[u8],
+    base_address: usize,
+    table: &mut FlagHitTable,
+) -> Vec<MarkerMatch> {
+    let mut matches = Vec::new();
+
+    let (ascii_ac, ascii_names) = tool_marker_ascii_automaton();
+    for m in ascii_ac.find_iter(buffer) {
+        let name = ascii_names[m.pattern().as_usize()];
+        if !is_marker_boundary_ok(buffer, m.start(), m.end() - m.start()) {
+            continue;
+        }
+        table.record_tool_marker(name, base_address.saturating_add(m.start()));
+        if matches.len() < MAX_MARKER_MATCHES_PER_CHUNK {
+            matches.push(MarkerMatch {
+                name,
+                start: m.start(),
+            });
+        }
+    }
+
+    let (wide_ac, wide_names) = tool_marker_wide_automaton();
+    for m in wide_ac.find_iter(buffer) {
+        let name = wide_names[m.pattern().as_usize()];
+        if !is_wide_marker_boundary_ok(buffer, m.start(), m.end() - m.start()) {
+            continue;
+        }
+        table.record_tool_marker(name, base_address.saturating_add(m.start()));
+        if matches.len() < MAX_MARKER_MATCHES_PER_CHUNK {
+            matches.push(MarkerMatch {
+                name,
+                start: m.start(),
+            });
+        }
+    }
+
+    matches
 }
 
 /// Generic prefix scan. Every FFlag prefix starts with `D`, `F`, or `S`, so
@@ -466,10 +858,7 @@ fn scan_prefix_hits(buffer: &[u8]) -> Vec<(usize, String, bool)> {
         }
 
         let mut j = body_start;
-        while j < buffer.len()
-            && j - body_start < MAX_IDENT_BODY_LEN
-            && is_ident_byte(buffer[j])
-        {
+        while j < buffer.len() && j - body_start < MAX_IDENT_BODY_LEN && is_ident_byte(buffer[j]) {
             j += 1;
         }
         let body_len = j - body_start;
@@ -489,6 +878,9 @@ fn scan_prefix_hits(buffer: &[u8]) -> Vec<(usize, String, bool)> {
 
         let is_known = known.contains(name.as_str()) || is_allowed_flag(&name);
         out.push((i, name, is_known));
+        if out.len() >= MAX_PREFIX_HITS_PER_CHUNK {
+            break;
+        }
         // Jump past the identifier so its interior isn't re-examined.
         cursor = j;
     }
@@ -515,7 +907,7 @@ fn known_wide_automaton() -> &'static (aho_corasick::AhoCorasick, Vec<&'static s
         names.extend(MEDIUM_FLAGS.iter().copied());
         let patterns: Vec<Vec<u8>> = names.iter().map(|n| to_utf16le(n)).collect();
         let ac = aho_corasick::AhoCorasick::builder()
-            .match_kind(aho_corasick::MatchKind::Standard)
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
             .build(&patterns)
             .expect("aho-corasick automaton build should not fail over static flag set");
         (ac, names)
@@ -526,7 +918,39 @@ fn known_wide_automaton() -> &'static (aho_corasick::AhoCorasick, Vec<&'static s
 /// using the cached Aho-Corasick automaton. Targeted (against known lists)
 /// rather than generic because UTF-16 noise generates unacceptable
 /// false-positive rates otherwise.
-fn scan_wide_known(buffer: &[u8], base_address: usize, table: &mut FlagHitTable) {
+fn scan_ascii_known(
+    buffer: &[u8],
+    base_address: usize,
+    markers: &[MarkerMatch],
+    table: &mut FlagHitTable,
+) {
+    let (ac, names) = known_ascii_automaton();
+    for m in ac.find_iter(buffer) {
+        let start = m.start();
+        let len = m.end() - start;
+        if !is_boundary_ok(buffer, start, len) {
+            continue;
+        }
+        let name = names[m.pattern().as_usize()];
+        let address = base_address.saturating_add(start);
+        let value = extract_adjacent_value_ascii(buffer, start + len);
+        let context_summary = value
+            .as_ref()
+            .and_then(|_| injector_context_summary_near(markers, start));
+        table.record_with_value(name, address, false, value, context_summary);
+    }
+}
+
+/// Scan a buffer for UTF-16LE occurrences of any known suspicious flag name
+/// using the cached Aho-Corasick automaton. Targeted (against known lists)
+/// rather than generic because UTF-16 noise generates unacceptable
+/// false-positive rates otherwise.
+fn scan_wide_known(
+    buffer: &[u8],
+    base_address: usize,
+    markers: &[MarkerMatch],
+    table: &mut FlagHitTable,
+) {
     let (ac, names) = known_wide_automaton();
     for m in ac.find_iter(buffer) {
         let start = m.start();
@@ -537,7 +961,10 @@ fn scan_wide_known(buffer: &[u8], base_address: usize, table: &mut FlagHitTable)
         let name = names[m.pattern().as_usize()];
         let address = base_address.saturating_add(start);
         let value = extract_adjacent_value_wide(buffer, start + len);
-        table.record_with_value(name, address, true, value);
+        let context_summary = value
+            .as_ref()
+            .and_then(|_| injector_context_summary_near(markers, start));
+        table.record_with_value(name, address, true, value, context_summary);
     }
 }
 
@@ -577,54 +1004,52 @@ fn is_wide_boundary_ok(buffer: &[u8], start: usize, len: usize) -> bool {
 /// Core per-buffer scan. Combines generic prefix discovery (ASCII) + targeted
 /// UTF-16LE search against known lists. Updates the shared hit table.
 fn scan_buffer(buffer: &[u8], base_address: usize, table: &mut FlagHitTable) {
+    let markers = scan_tool_markers(buffer, base_address, table);
+    // ASCII targeted scan — catches known suspicious names with and without
+    // Roblox's standard FFlag prefixes. Collection is broad, verdicting is not.
+    scan_ascii_known(buffer, base_address, &markers, table);
+
     // ASCII generic prefix scan — captures known AND unknown flags.
     for (offset, name, _is_known) in scan_prefix_hits(buffer) {
+        if known_flag_set().contains(name.as_str()) {
+            continue;
+        }
         let address = base_address.saturating_add(offset);
         let match_end = offset + name.len();
         let value = extract_adjacent_value_ascii(buffer, match_end);
-        table.record_with_value(&name, address, false, value);
+        let context_summary = value
+            .as_ref()
+            .and_then(|_| injector_context_summary_near(&markers, offset));
+        table.record_with_value(&name, address, false, value, context_summary);
     }
     // UTF-16LE targeted scan for known names.
-    scan_wide_known(buffer, base_address, table);
+    scan_wide_known(buffer, base_address, &markers, table);
 }
 
-/// Emit findings from the hit table.
-///
+fn marker_summary(table: &FlagHitTable) -> String {
+    if table.tool_markers.is_empty() {
+        return "none".to_string();
+    }
+    let mut markers: Vec<(&&'static str, &ToolMarkerHit)> = table.tool_markers.iter().collect();
+    markers.sort_by(|a, b| a.0.cmp(b.0));
+    markers
+        .into_iter()
+        .take(8)
+        .map(|(name, hit)| format!("{} x{} @0x{:X}", name, hit.count, hit.first_address))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Build scan findings from the aggregated hit table.
 ///
-/// v0.5.2: Memory-side flag NAME matching is an unreliable injection
-/// signal and is no longer used to produce Suspicious/Flagged findings.
-///
-/// Why: Roblox's client startup fetches a remote flag config from
-/// Roblox's config endpoint and stores the JSON response in heap. It
-/// also ships internal default flag configurations. Both land as byte
-/// runs of the form `"FlagName":value` — byte-for-byte identical to
-/// what an injector writing a serialized config into heap would
-/// produce. The value-proximity gate shipped in v0.5.1 therefore still
-/// fired on every vanilla client because Roblox's own server response
-/// provides the same shape. Trying to disambiguate at the name/value
-/// level requires reverse-engineering Roblox's flag-loading pipeline,
-/// which shifts across client versions.
-///
-/// Authoritative override-detection paths that replace this:
-///   - `client_settings_scanner`: reads ClientAppSettings.json and
-///     bootstrapper configs directly — the user-writable file is the
-///     real source of truth for file-backed overrides.
-///   - `file_scanner` + `known_tools.rs`: hashes LornoFix / FFlagToolkit
-///     binaries and detects the sibling-config disk layout.
-///   - `process_scanner`: running-process match on known tool names.
-///   - `scan_modules_windows` (same file, above): flags DLLs loaded
-///     into Roblox from untrusted paths — this is how DLL-injection
-///     style cheats are caught.
-///   - The RWX region enumeration in `scan_windows`: PAGE_EXECUTE_READWRITE
-///     pages in the Roblox process surface as Suspicious — that is the
-///     hallmark of runtime code patchers and shellcode loaders.
-///
-/// This function now emits at most ONE Clean-informational finding,
-/// summarizing how many FFlag-shaped identifiers were observed in
-/// heap so the operator has the count for debugging. It never emits
-/// Suspicious or Flagged verdicts — the memory scanner's verdict is
-/// driven solely by RWX / module / environmental signals.
+/// Bare flag names and plain `"FlagName": value` blobs stay informational:
+/// vanilla Roblox keeps its remote flag configuration and internal registry in
+/// heap, and those byte shapes look exactly like serialized overrides. The
+/// memory scanner only raises a cheat verdict when a known suspicious flag has
+/// an adjacent parsed value AND that value is near injector / offset-tool
+/// provenance such as `fflags.json` + `address.json`, `LornoFix`, or
+/// `WriteProcessMemory`. That catches the common runtime-injection artefact
+/// without turning Roblox's own heap into false positives.
 fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
     const SAMPLE_LIMIT: usize = 25;
     let mut out = Vec::new();
@@ -641,13 +1066,55 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
     let mut seen_wide = false;
     let mut samples: Vec<String> = Vec::new();
 
-    for (name, hit) in entries {
+    for &(name, hit) in &entries {
         // Allowlisted names don't enter the count at all — Roblox's own
         // September 2025 allowlist permits them in every configuration
         // path, so their presence in heap is explicitly sanctioned.
         if is_allowed_flag(name) {
             continue;
         }
+
+        let mut verdict = get_flag_severity(name);
+        let context_sample = hit
+            .value_samples
+            .iter()
+            .find(|s| s.context_summary.is_some());
+        if matches!(verdict, ScanVerdict::Clean)
+            && get_flag_category(name).is_none()
+            && context_sample.is_some()
+        {
+            verdict = ScanVerdict::Suspicious;
+        }
+        if matches!(verdict, ScanVerdict::Flagged | ScanVerdict::Suspicious) {
+            if let Some(sample) = context_sample {
+                let category = get_flag_category(name).unwrap_or("UNKNOWN");
+                let desc = get_flag_description(name)
+                    .map(|d| format!(" | {}", d))
+                    .unwrap_or_default();
+                let encoding = if sample.wide { "utf16" } else { "ascii" };
+                let label = match verdict {
+                    ScanVerdict::Flagged => "Critical runtime FFlag injection evidence",
+                    ScanVerdict::Suspicious => "Suspicious runtime FFlag injection evidence",
+                    ScanVerdict::Clean | ScanVerdict::Inconclusive => "Runtime FFlag evidence",
+                };
+                out.push(ScanFinding::new(
+                    "memory_scanner",
+                    verdict,
+                    format!("{}: \"{}\" = {}", label, name, sample.value),
+                    Some(format!(
+                        "Address: 0x{:X} | Encoding: {} | Occurrences: {} | Category: {}{} | Context: value was within {} bytes of injector/offset-tool provenance | Observed markers: {}",
+                        sample.address,
+                        encoding,
+                        hit.count,
+                        category,
+                        desc,
+                        INJECTOR_CONTEXT_WINDOW_BYTES,
+                        sample.context_summary.as_deref().unwrap_or("unknown")
+                    )),
+                ));
+            }
+        }
+
         unique += 1;
         total_occurrences = total_occurrences.saturating_add(hit.count as u64);
         seen_ascii |= hit.seen_ascii;
@@ -682,12 +1149,16 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
         "memory_scanner",
         ScanVerdict::Clean,
         format!(
-            "{} FFlag-shaped identifiers observed in Roblox heap (baseline registry — not a cheat signal). File-backed overrides are detected by the client_settings scanner.",
+            "{} non-allowlisted FFlag-shaped identifiers observed in Roblox heap. Bare names / plain values are baseline Roblox heap data; only nearby injector-context values affect the verdict.",
             unique
         ),
         Some(format!(
-            "Unique names: {} | Total occurrences: {} | Encoding: {}{}",
-            unique, total_occurrences, encoding, sample_line
+            "Unique names: {} | Total occurrences: {} | Encoding: {} | Injector/offset markers observed: {}{}",
+            unique,
+            total_occurrences,
+            encoding,
+            marker_summary(table),
+            sample_line
         )),
     ));
 
@@ -708,9 +1179,9 @@ mod windows_impl {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, MAX_PATH};
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Memory::{
-        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE,
-        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
-        PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOPY,
     };
     use windows_sys::Win32::System::ProcessStatus::{
         EnumProcessModulesEx, GetModuleFileNameExW, LIST_MODULES_ALL,
@@ -736,7 +1207,7 @@ mod windows_impl {
     fn chunk_overlap_bytes() -> usize {
         // Longest prefix is "DFString" / "SFString" at 8 chars.
         let max_name = 8 + MAX_IDENT_BODY_LEN;
-        max_name * 2 + 4
+        INJECTOR_CONTEXT_WINDOW_BYTES + (max_name * 2) + MAX_VALUE_CAPTURE_BYTES + 8
     }
 
     /// Read every chunk of a single committed region into `scratch` and feed
@@ -752,6 +1223,7 @@ mod windows_impl {
         overlap: usize,
         bytes_scanned: &AtomicU64,
         regions_scanned: &AtomicUsize,
+        read_failures: &AtomicUsize,
         timed_out: &AtomicBool,
     ) {
         if scratch.capacity() < MAX_CHUNK_BYTES {
@@ -763,14 +1235,7 @@ mod windows_impl {
                 return;
             }
             let this_chunk = (size - offset).min(MAX_CHUNK_BYTES);
-            // SAFETY: `scratch` has capacity >= MAX_CHUNK_BYTES >= this_chunk.
-            // We never read `scratch[..this_chunk]` unless `ReadProcessMemory`
-            // writes into it — and then only the `bytes_read` prefix it
-            // actually filled. Avoids the ~16 MiB memset the old
-            // `resize(this_chunk, 0)` path performed per chunk.
-            unsafe {
-                scratch.set_len(this_chunk);
-            }
+            scratch.resize(this_chunk, 0);
             let mut bytes_read: usize = 0;
             let read_ok = unsafe {
                 ReadProcessMemory(
@@ -781,10 +1246,11 @@ mod windows_impl {
                     &mut bytes_read,
                 )
             };
-            if read_ok != 0 && bytes_read > 0 {
+            if read_ok != 0 && bytes_read > 0 && bytes_read <= this_chunk {
                 bytes_scanned.fetch_add(bytes_read as u64, Ordering::Relaxed);
                 scan_buffer(&scratch[..bytes_read], addr + offset, local);
             } else {
+                read_failures.fetch_add(1, Ordering::Relaxed);
                 offset = offset.saturating_add(this_chunk);
                 continue;
             }
@@ -964,6 +1430,7 @@ mod windows_impl {
         // FlagHitTable; tables are merged at the end via `.reduce`.
         let bytes_scanned = Arc::new(AtomicU64::new(0));
         let regions_scanned = Arc::new(AtomicUsize::new(0));
+        let read_failures = Arc::new(AtomicUsize::new(0));
         let timed_out = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -1009,7 +1476,12 @@ mod windows_impl {
         let table = regions_to_scan
             .par_iter()
             .fold(
-                || (FlagHitTable::default(), Vec::<u8>::with_capacity(MAX_CHUNK_BYTES)),
+                || {
+                    (
+                        FlagHitTable::default(),
+                        Vec::<u8>::with_capacity(MAX_CHUNK_BYTES),
+                    )
+                },
                 |(mut local, mut scratch), &(addr, size)| {
                     if !timed_out.load(Ordering::Relaxed) {
                         scan_region_into(
@@ -1021,6 +1493,7 @@ mod windows_impl {
                             overlap,
                             &bytes_scanned,
                             &regions_scanned,
+                            &read_failures,
                             &timed_out,
                         );
                     }
@@ -1041,11 +1514,13 @@ mod windows_impl {
 
         let bytes_scanned_final = bytes_scanned.load(Ordering::Relaxed);
         let regions_scanned_final = regions_scanned.load(Ordering::Relaxed);
+        let read_failures_final = read_failures.load(Ordering::Relaxed);
         let timed_out_final = timed_out.load(Ordering::Relaxed);
         // Shadow the names the legacy reporting block below used, so the
         // diff between old and new is minimal.
         let bytes_scanned = bytes_scanned_final;
         let regions_scanned = regions_scanned_final;
+        let read_failures = read_failures_final;
         let timed_out = timed_out_final;
 
         // Emit flag findings.
@@ -1096,6 +1571,17 @@ mod windows_impl {
                 Some(format!(
                     "PID: {}, truncated_regions: {}, per_region_cap_bytes: {}",
                     pid, truncated_regions, ABS_REGION_CAP
+                )),
+            ));
+        }
+        if read_failures > 0 {
+            findings.push(ScanFinding::new(
+                "memory_scanner",
+                ScanVerdict::Inconclusive,
+                "Some readable memory chunks could not be read — memory scan coverage was incomplete",
+                Some(format!(
+                    "PID: {}, read_failures: {}, regions_scanned: {}, bytes_scanned: {}",
+                    pid, read_failures, regions_scanned, bytes_scanned
                 )),
             ));
         }
@@ -1300,10 +1786,7 @@ mod windows_impl {
                 roots.push(format!("{}\\common files\\", pf_lower));
                 // Roblox UWP package family (not the entire Store).
                 if pf_var == "ProgramFiles" {
-                    roots.push(format!(
-                        "{}\\windowsapps\\robloxcorporation.",
-                        pf_lower
-                    ));
+                    roots.push(format!("{}\\windowsapps\\robloxcorporation.", pf_lower));
                 }
             }
         }
@@ -1343,9 +1826,7 @@ mod windows_impl {
         // or `C:\...\OneDrive - Work\Desktop\...`) produced a hard Flagged
         // verdict. The anchored form still catches a real injector running
         // from the user's actual Downloads/Desktop folder.
-        let userprofile_lower = std::env::var("UserProfile")
-            .ok()
-            .map(|p| p.to_lowercase());
+        let userprofile_lower = std::env::var("UserProfile").ok().map(|p| p.to_lowercase());
         if let Some(up) = userprofile_lower {
             let user_desktop = format!("{}\\desktop\\", up);
             let user_downloads = format!("{}\\downloads\\", up);
@@ -1396,32 +1877,47 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn trust_roots_include_bloxstrap_and_fishstrap() {
-        // SAFETY: std::env::set_var is unsafe in Rust 2024 editions but the
-        // memory_scanner module is 2021 so this is still a plain fn call.
+        let old_local_app_data = std::env::var_os("LocalAppData");
         std::env::set_var("LocalAppData", "C:\\Users\\test\\AppData\\Local");
         let roots = windows_impl::trusted_windows_roblox_roots();
+        if let Some(value) = old_local_app_data {
+            std::env::set_var("LocalAppData", value);
+        } else {
+            std::env::remove_var("LocalAppData");
+        }
+
         let has_bloxstrap = roots.iter().any(|r| {
             r.eq_ignore_ascii_case("C:\\Users\\test\\AppData\\Local\\Bloxstrap\\Versions\\")
         });
         let has_fishstrap = roots.iter().any(|r| {
             r.eq_ignore_ascii_case("C:\\Users\\test\\AppData\\Local\\Fishstrap\\Versions\\")
         });
-        assert!(has_bloxstrap, "Bloxstrap Versions path missing from trust list: {roots:?}");
-        assert!(has_fishstrap, "Fishstrap Versions path missing from trust list: {roots:?}");
+        assert!(
+            has_bloxstrap,
+            "Bloxstrap Versions path missing from trust list: {roots:?}"
+        );
+        assert!(
+            has_fishstrap,
+            "Fishstrap Versions path missing from trust list: {roots:?}"
+        );
     }
 
     #[test]
     fn prefix_scan_finds_known_flag() {
         let b = bytes("{\"DFIntS2PhysicsSenderRate\":1}");
         let hits = scan_prefix_hits(&b);
-        assert!(hits.iter().any(|(_, n, known)| n == "DFIntS2PhysicsSenderRate" && *known));
+        assert!(hits
+            .iter()
+            .any(|(_, n, known)| n == "DFIntS2PhysicsSenderRate" && *known));
     }
 
     #[test]
     fn prefix_scan_finds_unknown_flag() {
         let b = bytes("junk\"FFlagTotallyMadeUpNewFlag\":true more junk");
         let hits = scan_prefix_hits(&b);
-        let got = hits.iter().find(|(_, n, known)| n == "FFlagTotallyMadeUpNewFlag" && !*known);
+        let got = hits
+            .iter()
+            .find(|(_, n, known)| n == "FFlagTotallyMadeUpNewFlag" && !*known);
         assert!(got.is_some(), "unknown flag must still be reported");
     }
 
@@ -1467,10 +1963,9 @@ mod tests {
 
     #[test]
     fn contextual_match_requires_delimiter_context() {
-        let b = bytes("randombinaryFFlagDebugXY"); // no delimiter before the prefix
-        // The byte before 'F' is 'y' — an ident byte — so boundary check should
-        // reject. scan_prefix_hits covers this via its own boundary check,
-        // but here we exercise is_contextual_match directly.
+        // No delimiter before the prefix. The byte before 'F' is 'y' — an
+        // ident byte — so the boundary check should reject.
+        let b = bytes("randombinaryFFlagDebugXY");
         assert!(!is_contextual_match(&b, 12, 14));
     }
 
@@ -1481,7 +1976,7 @@ mod tests {
         buf.extend_from_slice(&to_utf16le("DFIntS2PhysicsSenderRate"));
         buf.extend_from_slice(&[0u8; 4]);
         let mut table = FlagHitTable::default();
-        scan_wide_known(&buf, 0x1000, &mut table);
+        scan_wide_known(&buf, 0x1000, &[], &mut table);
         let hit = table.hits.get("DFIntS2PhysicsSenderRate").expect("hit");
         assert_eq!(hit.count, 1);
         assert!(hit.seen_wide);
@@ -1512,9 +2007,12 @@ mod tests {
     fn findings_skip_allowlisted_flag() {
         // Pretend we saw an allowlisted flag in memory — it should not produce a finding.
         let mut table = FlagHitTable::default();
-        table.record("FFlagDebugGraphicsPreferD3D11", 0x1000, false);
+        table.record_with_value("FFlagDebugGraphicsPreferD3D11", 0x1000, false, None, None);
         let findings = findings_from_table(&table);
-        assert!(findings.is_empty(), "allowlisted flag must not be a finding");
+        assert!(
+            findings.is_empty(),
+            "allowlisted flag must not be a finding"
+        );
     }
 
     #[test]
@@ -1527,7 +2025,7 @@ mod tests {
         // Clean/informational so count + samples remain inspectable
         // without polluting the overall verdict.
         let mut table = FlagHitTable::default();
-        table.record("FFlagCompletelyUnknownThing", 0x2000, false);
+        table.record_with_value("FFlagCompletelyUnknownThing", 0x2000, false, None, None);
         let findings = findings_from_table(&table);
         assert_eq!(findings.len(), 1);
         match &findings[0].verdict {
@@ -1552,13 +2050,21 @@ mod tests {
             0x1000,
             false,
             Some("1".to_string()),
+            None,
         );
-        table.record_with_value("FIntCameraFarZPlane", 0x2000, false, Some("1".to_string()));
+        table.record_with_value(
+            "FIntCameraFarZPlane",
+            0x2000,
+            false,
+            Some("1".to_string()),
+            None,
+        );
         table.record_with_value(
             "DFIntCSGv2LodsToGenerate",
             0x3000,
             false,
             Some("0".to_string()),
+            None,
         );
         let findings = findings_from_table(&table);
         for f in &findings {
@@ -1572,36 +2078,340 @@ mod tests {
     }
 
     #[test]
+    fn serialized_injector_fflags_json_with_critical_flag_is_flagged() {
+        let b = bytes(r#"fflags.json address.json {"DFIntS2PhysicsSenderRate":1}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0x5000, &mut table);
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Flagged)
+                    && f.description.contains("DFIntS2PhysicsSenderRate")
+                    && f.description.contains("= 1")
+            }),
+            "expected Flagged runtime-injection evidence, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn serialized_injector_fflags_json_with_high_flag_is_suspicious() {
+        let b = bytes(r#"fflags.json address.json {"FIntCameraFarZPlane":1}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0x6000, &mut table);
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Suspicious)
+                    && f.description.contains("FIntCameraFarZPlane")
+            }),
+            "expected Suspicious runtime-injection evidence, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn assignment_style_injector_value_is_parsed() {
+        let b = bytes(r#"fflags.json address.json DFIntS2PhysicsSenderRate=1"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0x7000, &mut table);
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Flagged)
+                    && f.description.contains("DFIntS2PhysicsSenderRate")
+                    && f.description.contains("= 1")
+            }),
+            "expected assignment-style value evidence, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn ascii_known_scan_catches_non_fflag_prefix_names() {
+        let b = bytes(r#"fflags.json address.json {"NextGenReplicatorEnabledWrite4":false}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0x8000, &mut table);
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Flagged)
+                    && f.description.contains("NextGenReplicatorEnabledWrite4")
+            }),
+            "expected non-prefix critical flag to be detected, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn vanilla_remote_config_blob_with_known_flag_values_stays_clean() {
+        let b = bytes(r#"{"DFIntS2PhysicsSenderRate":1,"FIntCameraFarZPlane":1}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0x9000, &mut table);
+        assert!(
+            table.hits.contains_key("DFIntS2PhysicsSenderRate"),
+            "test setup must exercise a real memory hit"
+        );
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings
+                .iter()
+                .all(|f| matches!(f.verdict, ScanVerdict::Clean)),
+            "plain Roblox-style config blob must stay informational, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn injector_markers_with_allowlisted_only_do_not_raise_verdict() {
+        let b = bytes(r#"fflags.json address.json {"FFlagDebugGraphicsPreferD3D11":true}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xA000, &mut table);
+        assert!(
+            table.hits.contains_key("FFlagDebugGraphicsPreferD3D11"),
+            "test setup must exercise an allowlisted memory hit"
+        );
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings
+                .iter()
+                .all(|f| matches!(f.verdict, ScanVerdict::Clean)),
+            "allowlisted-only injector-shaped blob must not raise verdict, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn distant_injector_marker_does_not_taint_vanilla_config_blob() {
+        let mut b = bytes("fflags.json address.json");
+        b.extend(std::iter::repeat(b' ').take(INJECTOR_CONTEXT_WINDOW_BYTES + 512));
+        b.extend_from_slice(br#"{"DFIntS2PhysicsSenderRate":1}"#);
+
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xB000, &mut table);
+        assert!(
+            table.hits.contains_key("DFIntS2PhysicsSenderRate"),
+            "test setup must exercise a real memory hit"
+        );
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings
+                .iter()
+                .all(|f| matches!(f.verdict, ScanVerdict::Clean)),
+            "distant marker must not taint flag value, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn serialized_wide_injector_config_with_critical_flag_is_flagged() {
+        let b = to_utf16le(r#"fflags.json address.json {"DFIntS2PhysicsSenderRate":1}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xC000, &mut table);
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Flagged)
+                    && f.description.contains("DFIntS2PhysicsSenderRate")
+            }),
+            "expected UTF-16 injector evidence to be flagged, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn newline_separated_injector_value_is_parsed() {
+        let b = bytes("fflags.json\r\naddress.json\r\n{\"DFIntS2PhysicsSenderRate\":\r\n 1}");
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xD000, &mut table);
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Flagged)
+                    && f.description.contains("DFIntS2PhysicsSenderRate")
+                    && f.description.contains("= 1")
+            }),
+            "expected CRLF-separated value evidence to be flagged, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn malformed_adjacent_literals_do_not_create_injection_evidence() {
+        let b = bytes(
+            r#"fflags.json address.json {"DFIntS2PhysicsSenderRate":1eZ,"FIntCameraFarZPlane":"unterminated}"#,
+        );
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xD100, &mut table);
+        assert!(
+            table.hits.contains_key("DFIntS2PhysicsSenderRate"),
+            "test setup must still observe the critical flag name"
+        );
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings
+                .iter()
+                .all(|f| matches!(f.verdict, ScanVerdict::Clean)),
+            "malformed literals must not create elevated evidence, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn single_tool_marker_alone_does_not_taint_flag_value() {
+        let b = bytes(r#"lornofix {"DFIntS2PhysicsSenderRate":1}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xD200, &mut table);
+        assert!(table.tool_markers.contains_key("lornofix"));
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings
+                .iter()
+                .all(|f| matches!(f.verdict, ScanVerdict::Clean)),
+            "single strong marker must not taint a value, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn marker_substrings_are_not_context_markers() {
+        let b =
+            bytes(r#"myfflags.json.backup address.json.example {"DFIntS2PhysicsSenderRate":1}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xD300, &mut table);
+        assert!(
+            table.tool_markers.is_empty(),
+            "marker substrings should not be recorded: {:?}",
+            marker_summary(&table)
+        );
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings
+                .iter()
+                .all(|f| matches!(f.verdict, ScanVerdict::Clean)),
+            "substring marker matches must not taint a value, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn unknown_injected_fflag_with_context_is_suspicious() {
+        let b = bytes(r#"fflags.json address.json {"FFlagTotallyMadeUpNewFlag":true}"#);
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xD400, &mut table);
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Suspicious)
+                    && f.description.contains("FFlagTotallyMadeUpNewFlag")
+            }),
+            "unknown context-backed FFlag should be suspicious, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn context_sample_survives_value_sample_cap() {
+        let mut table = FlagHitTable::default();
+        for value in 0..MAX_VALUE_SAMPLES_PER_FLAG {
+            table.record_with_value(
+                "DFIntS2PhysicsSenderRate",
+                0xE000 + value,
+                false,
+                Some(value.to_string()),
+                None,
+            );
+        }
+        table.record_with_value(
+            "DFIntS2PhysicsSenderRate",
+            0xE100,
+            false,
+            Some("999".to_string()),
+            Some("fflags.json, address.json".to_string()),
+        );
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Flagged)
+                    && f.description.contains("DFIntS2PhysicsSenderRate")
+                    && f.description.contains("= 999")
+            }),
+            "context-backed sample should replace non-context samples, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn wide_known_scan_prefers_longest_prefix_sharing_flag() {
+        let b = to_utf16le(
+            r#"fflags.json address.json {"DFIntPhysicsSenderMaxBandwidthBpsScaling":0}"#,
+        );
+        let mut table = FlagHitTable::default();
+        scan_buffer(&b, 0xE200, &mut table);
+
+        let findings = findings_from_table(&table);
+        assert!(
+            findings.iter().any(|f| {
+                matches!(f.verdict, ScanVerdict::Flagged)
+                    && f.description
+                        .contains("DFIntPhysicsSenderMaxBandwidthBpsScaling")
+                    && f.description.contains("= 0")
+            }),
+            "longer UTF-16 flag should win over its prefix, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
     fn chunked_boundary_hit_is_recoverable() {
         // Simulate a chunk boundary: split a flag identifier across two
         // chunks, with an overlap large enough to recover the straddler.
         // Previous version of this test let `second_start` saturate to 0,
-        // which meant chunk_b was the full payload and the test was
-        // vacuous. Here we deliberately pick offsets so chunk_a alone and
-        // chunk_b alone each contain only PART of the flag — only the
-        // overlap replay can find it.
+        // which meant chunk_b was the full payload and the test was vacuous.
+        // Here the second chunk starts at a non-zero replay offset before the
+        // flag and contains the complete identifier only because of overlap.
         let flag = "DFIntS2PhysicsSenderRate";
-        let payload = format!("\"{}\":1", flag);
+        let prefix = "x".repeat(96);
+        let payload = format!("{}{{\"{}\":1}}", prefix, flag);
         let bytes = payload.as_bytes();
+        let flag_start = payload.find(flag).expect("flag start");
 
-        // Cut the buffer so chunk_a ends mid-flag and chunk_b starts mid-flag,
-        // with an overlap window that brackets the full flag string.
-        let cut = 12usize; // cuts inside `DFIntS2PhysicsSe...`
-        let overlap = 20usize;
-        let second_start = cut.saturating_sub(overlap.min(cut));
+        // Cut inside `DFInt...`; the replay starts before the flag but not at
+        // byte 0, proving the second scan is a genuine overlapped chunk.
+        let cut = flag_start + 12;
+        let overlap = 24usize;
+        let second_start = cut.saturating_sub(overlap);
         let chunk_a = &bytes[..cut];
         let chunk_b = &bytes[second_start..];
 
-        // Sanity-check the test setup: neither chunk_a nor chunk_b alone
-        // contains the full identifier, so the only path to a hit is the
-        // overlap-replay logic.
+        // Sanity-check the test setup: chunk_a lacks the full identifier,
+        // while chunk_b contains it only due to non-zero overlap replay.
         let chunk_a_str = std::str::from_utf8(chunk_a).unwrap();
         let chunk_b_str = std::str::from_utf8(chunk_b).unwrap();
-        assert!(!chunk_a_str.contains(flag), "test setup: chunk_a must not contain whole flag");
-        // chunk_b may or may not contain the whole flag depending on overlap;
-        // require either that it doesn't, OR the test is genuinely exercising
-        // the boundary case where only the second chunk catches it. Either
-        // way the assertion below is the real test.
+        assert!(second_start > 0, "test setup must not replay from byte 0");
+        assert!(second_start < flag_start, "replay must start before flag");
+        assert!(
+            !chunk_a_str.contains(flag),
+            "test setup: chunk_a must not contain whole flag"
+        );
+        assert!(
+            chunk_b_str.contains(flag),
+            "test setup: overlap chunk must recover whole flag"
+        );
 
         let mut table = FlagHitTable::default();
         scan_buffer(chunk_a, 0, &mut table);
