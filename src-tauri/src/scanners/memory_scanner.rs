@@ -42,10 +42,25 @@ const MAX_SCAN_DURATION: std::time::Duration = std::time::Duration::from_secs(90
 /// across chunk boundaries.
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
-/// Absolute per-region cap. Regions larger than this (>512 MiB) are only
-/// partially scanned (the first ABS_REGION_CAP bytes), with a finding noting
-/// the truncation, to keep total scan time bounded.
-const ABS_REGION_CAP: usize = 512 * 1024 * 1024;
+/// Absolute per-region cap. Regions larger than this (>1 GiB) are only
+/// partially scanned (the first ABS_REGION_CAP bytes), with coverage
+/// accounting noting the truncation, to keep total scan time bounded.
+const ABS_REGION_CAP: usize = 1024 * 1024 * 1024;
+
+/// Fallback read granularity when a large ReadProcessMemory call fails.
+/// Windows x64 uses 4 KiB pages; falling back this far prevents one raced page
+/// from hiding an otherwise readable 16 MiB chunk.
+const MIN_READ_CHUNK_BYTES: usize = 4 * 1024;
+
+/// Do not scare users for normal Windows/Roblox memory churn. Even with an
+/// administrator handle, pages can be decommitted or reprotected between
+/// VirtualQueryEx and ReadProcessMemory. Surface a coverage warning only when
+/// the unread/skipped span is large in absolute terms, large relative to the
+/// intended scan, or effectively the whole memory scan.
+const COVERAGE_WARNING_MIN_MISSING_BYTES: u64 = 512 * 1024 * 1024;
+const COVERAGE_WARNING_LARGE_MISSING_BYTES: u64 = 1024 * 1024 * 1024;
+const COVERAGE_WARNING_MIN_MISSING_PERCENT: u64 = 25;
+const COVERAGE_WARNING_NEAR_TOTAL_MISSING_PERCENT: u64 = 90;
 
 /// Maximum distance between a flag/value pair and injector/offset-tool
 /// provenance strings for the value to be treated as runtime injection
@@ -242,6 +257,71 @@ fn push_value_sample(
     }
 }
 
+fn percent(part: u64, total: u64) -> u64 {
+    if total == 0 {
+        0
+    } else {
+        part.min(total).saturating_mul(100) / total
+    }
+}
+
+fn coverage_gap_is_material(missing_bytes: u64, intended_bytes: u64) -> bool {
+    if missing_bytes == 0 || intended_bytes == 0 {
+        return false;
+    }
+    let missing_percent = percent(missing_bytes, intended_bytes);
+    missing_bytes >= COVERAGE_WARNING_LARGE_MISSING_BYTES
+        || missing_percent >= COVERAGE_WARNING_NEAR_TOTAL_MISSING_PERCENT
+        || (missing_bytes >= COVERAGE_WARNING_MIN_MISSING_BYTES
+            && missing_percent >= COVERAGE_WARNING_MIN_MISSING_PERCENT)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MemoryCoverage {
+    intended_bytes: u64,
+    bytes_scanned: u64,
+    regions_scanned: usize,
+    truncated_regions: usize,
+    truncated_bytes: u64,
+    read_failures: usize,
+    read_failed_bytes: u64,
+}
+
+impl MemoryCoverage {
+    fn gap_bytes(self) -> u64 {
+        self.truncated_bytes
+            .saturating_add(self.read_failed_bytes)
+            .min(self.intended_bytes)
+    }
+
+    fn gap_percent(self) -> u64 {
+        percent(self.gap_bytes(), self.intended_bytes)
+    }
+
+    fn no_successful_reads(self) -> bool {
+        self.intended_bytes > 0 && self.bytes_scanned == 0
+    }
+
+    fn material_gap(self) -> bool {
+        coverage_gap_is_material(self.gap_bytes(), self.intended_bytes)
+    }
+
+    fn details(self) -> String {
+        format!(
+            "intended_bytes: {}, bytes_scanned: {}, regions_scanned: {}, coverage_gap_bytes: {}, coverage_gap_percent: {}%, truncated_regions: {}, truncated_bytes: {}, read_failures: {}, read_failed_bytes: {}",
+            self.intended_bytes,
+            self.bytes_scanned,
+            self.regions_scanned,
+            self.gap_bytes(),
+            self.gap_percent(),
+            self.truncated_regions,
+            self.truncated_bytes,
+            self.read_failures,
+            self.read_failed_bytes
+        )
+    }
+}
+
 /// Scan Roblox process memory for runtime FFlag injections.
 #[allow(dead_code)]
 pub async fn scan() -> Vec<ScanFinding> {
@@ -251,9 +331,23 @@ pub async fn scan() -> Vec<ScanFinding> {
 /// Same as [`scan`] but accepts a progress reporter so the frontend can show
 /// live region/byte counters while the Windows memory walk is in flight.
 pub async fn scan_with_progress(reporter: ScanProgress) -> Vec<ScanFinding> {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
     {
         scan_windows(reporter).await
+    }
+
+    #[cfg(all(target_os = "windows", not(target_pointer_width = "64")))]
+    {
+        let _ = reporter;
+        vec![ScanFinding::new(
+            "memory_scanner",
+            ScanVerdict::Inconclusive,
+            "Memory scan requires a 64-bit Windows build",
+            Some(
+                "32-bit Windows builds cannot safely inspect a 64-bit Roblox address space."
+                    .to_string(),
+            ),
+        )]
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -270,7 +364,7 @@ pub async fn scan_with_progress(reporter: ScanProgress) -> Vec<ScanFinding> {
 
 /// Result of locating a Roblox process: the PID and whether the executable
 /// path passed basic validation against expected Roblox install roots.
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_pointer_width = "64"))]
 struct RobloxProcess {
     pid: u32,
     exe_path: Option<String>,
@@ -280,7 +374,7 @@ struct RobloxProcess {
 /// Find the Roblox process PID, validating the executable path against
 /// expected install roots. Falls back to name-only matching when the path
 /// cannot be read.
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_pointer_width = "64"))]
 fn find_roblox_process() -> Option<RobloxProcess> {
     use sysinfo::{ProcessRefreshKind, RefreshKind, System};
     let mut sys = System::new_with_specifics(
@@ -327,7 +421,7 @@ fn find_roblox_process() -> Option<RobloxProcess> {
 }
 
 /// Check whether an executable path looks like a real Roblox install.
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_pointer_width = "64"))]
 fn is_trusted_roblox_exe_path(exe_path: &str) -> bool {
     let lower = exe_path.to_lowercase();
     let roots: Vec<String> = trusted_windows_roblox_roots();
@@ -1168,7 +1262,7 @@ fn findings_from_table(table: &FlagHitTable) -> Vec<ScanFinding> {
 // ============================
 // Windows implementation
 // ============================
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_pointer_width = "64"))]
 mod windows_impl {
     use super::*;
     use rayon::prelude::*;
@@ -1210,10 +1304,144 @@ mod windows_impl {
         INJECTOR_CONTEXT_WINDOW_BYTES + (max_name * 2) + MAX_VALUE_CAPTURE_BYTES + 8
     }
 
+    struct ReadCounters<'a> {
+        bytes_scanned: &'a AtomicU64,
+        regions_scanned: &'a AtomicUsize,
+        read_failures: &'a AtomicUsize,
+        read_failed_bytes: &'a AtomicU64,
+        timed_out: &'a AtomicBool,
+    }
+
+    fn mark_region_scanned(counted_region: &mut bool, counters: &ReadCounters<'_>) {
+        if !*counted_region {
+            counters.regions_scanned.fetch_add(1, Ordering::Relaxed);
+            *counted_region = true;
+        }
+    }
+
+    fn try_read_and_scan(
+        local: &mut FlagHitTable,
+        scratch: &mut Vec<u8>,
+        handle: HANDLE,
+        addr: usize,
+        size: usize,
+        counters: &ReadCounters<'_>,
+        counted_region: &mut bool,
+    ) -> Option<usize> {
+        scratch.resize(size, 0);
+        let mut bytes_read: usize = 0;
+        let read_ok = unsafe {
+            ReadProcessMemory(
+                handle,
+                addr as *const c_void,
+                scratch.as_mut_ptr() as *mut c_void,
+                size,
+                &mut bytes_read,
+            )
+        };
+        if read_ok == 0 || bytes_read == 0 || bytes_read > size {
+            return None;
+        }
+
+        counters
+            .bytes_scanned
+            .fetch_add(bytes_read as u64, Ordering::Relaxed);
+        scan_buffer(&scratch[..bytes_read], addr, local);
+        mark_region_scanned(counted_region, counters);
+
+        // ReadProcessMemory should normally fail rather than report a short
+        // successful read, but account for the tail defensively instead of
+        // pretending it was covered.
+        if bytes_read < size {
+            counters.read_failures.fetch_add(1, Ordering::Relaxed);
+            counters
+                .read_failed_bytes
+                .fetch_add((size - bytes_read) as u64, Ordering::Relaxed);
+        }
+
+        Some(bytes_read)
+    }
+
+    fn scan_span_adaptive(
+        local: &mut FlagHitTable,
+        scratch: &mut Vec<u8>,
+        handle: HANDLE,
+        addr: usize,
+        size: usize,
+        overlap: usize,
+        counters: &ReadCounters<'_>,
+        counted_region: &mut bool,
+    ) -> u64 {
+        if size == 0 || counters.timed_out.load(Ordering::Relaxed) {
+            return 0;
+        }
+        if let Some(bytes_read) =
+            try_read_and_scan(local, scratch, handle, addr, size, counters, counted_region)
+        {
+            return bytes_read as u64;
+        }
+        if size <= MIN_READ_CHUNK_BYTES {
+            counters.read_failures.fetch_add(1, Ordering::Relaxed);
+            counters
+                .read_failed_bytes
+                .fetch_add(size as u64, Ordering::Relaxed);
+            return 0;
+        }
+
+        let split = if size > MIN_READ_CHUNK_BYTES * 2 {
+            (size / 2)
+                .max(MIN_READ_CHUNK_BYTES)
+                .min(size - MIN_READ_CHUNK_BYTES)
+        } else {
+            size / 2
+        };
+        if split == 0 || split >= size {
+            counters.read_failures.fetch_add(1, Ordering::Relaxed);
+            counters
+                .read_failed_bytes
+                .fetch_add(size as u64, Ordering::Relaxed);
+            return 0;
+        }
+
+        let split_overlap = if overlap > 0 && size > overlap.saturating_mul(4) {
+            overlap.min(split / 2).min((size - split) / 2)
+        } else {
+            0
+        };
+        let right_start = split.saturating_sub(split_overlap);
+
+        let left = scan_span_adaptive(
+            local,
+            scratch,
+            handle,
+            addr,
+            split,
+            overlap,
+            counters,
+            counted_region,
+        );
+        let right = if right_start < size && !counters.timed_out.load(Ordering::Relaxed) {
+            scan_span_adaptive(
+                local,
+                scratch,
+                handle,
+                addr.saturating_add(right_start),
+                size - right_start,
+                overlap,
+                counters,
+                counted_region,
+            )
+        } else {
+            0
+        };
+
+        left.saturating_add(right)
+    }
+
     /// Read every chunk of a single committed region into `scratch` and feed
     /// it to `scan_buffer`, updating the worker-local `FlagHitTable` and the
-    /// shared atomic counters. Checks `timed_out` between chunks so the
-    /// watchdog can abort mid-region.
+    /// shared atomic counters. Failed large reads are subdivided so one raced
+    /// page does not make the scanner skip an entire 16 MiB span.
     fn scan_region_into(
         local: &mut FlagHitTable,
         scratch: &mut Vec<u8>,
@@ -1224,36 +1452,36 @@ mod windows_impl {
         bytes_scanned: &AtomicU64,
         regions_scanned: &AtomicUsize,
         read_failures: &AtomicUsize,
+        read_failed_bytes: &AtomicU64,
         timed_out: &AtomicBool,
     ) {
         if scratch.capacity() < MAX_CHUNK_BYTES {
             scratch.reserve(MAX_CHUNK_BYTES - scratch.capacity());
         }
+        let counters = ReadCounters {
+            bytes_scanned,
+            regions_scanned,
+            read_failures,
+            read_failed_bytes,
+            timed_out,
+        };
+        let mut counted_region = false;
         let mut offset = 0usize;
         while offset < size {
             if timed_out.load(Ordering::Relaxed) {
                 return;
             }
             let this_chunk = (size - offset).min(MAX_CHUNK_BYTES);
-            scratch.resize(this_chunk, 0);
-            let mut bytes_read: usize = 0;
-            let read_ok = unsafe {
-                ReadProcessMemory(
-                    handle,
-                    (addr + offset) as *const c_void,
-                    scratch.as_mut_ptr() as *mut c_void,
-                    this_chunk,
-                    &mut bytes_read,
-                )
-            };
-            if read_ok != 0 && bytes_read > 0 && bytes_read <= this_chunk {
-                bytes_scanned.fetch_add(bytes_read as u64, Ordering::Relaxed);
-                scan_buffer(&scratch[..bytes_read], addr + offset, local);
-            } else {
-                read_failures.fetch_add(1, Ordering::Relaxed);
-                offset = offset.saturating_add(this_chunk);
-                continue;
-            }
+            let _ = scan_span_adaptive(
+                local,
+                scratch,
+                handle,
+                addr.saturating_add(offset),
+                this_chunk,
+                overlap,
+                &counters,
+                &mut counted_region,
+            );
             let advance = if this_chunk > overlap {
                 this_chunk - overlap
             } else {
@@ -1261,7 +1489,6 @@ mod windows_impl {
             };
             offset = offset.saturating_add(advance);
         }
-        regions_scanned.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) async fn scan_windows(reporter: ScanProgress) -> Vec<ScanFinding> {
@@ -1316,6 +1543,8 @@ mod windows_impl {
             return findings;
         }
         let handle = ScopedHandle(raw_handle);
+        let scan_started = std::time::Instant::now();
+        let timed_out = Arc::new(AtomicBool::new(false));
 
         // (1) Enumerate loaded modules, flag any outside trusted paths.
         findings.extend(scan_modules_windows(handle.0, pid));
@@ -1329,6 +1558,8 @@ mod windows_impl {
         let mut rwx_hits = 0usize;
         let mut regions_walked = 0usize;
         let mut truncated_regions = 0usize;
+        let mut intended_scan_bytes = 0u64;
+        let mut truncated_bytes = 0u64;
         let mut scan_completed = false;
 
         let overlap = chunk_overlap_bytes();
@@ -1339,6 +1570,10 @@ mod windows_impl {
             let mem_info_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
 
             loop {
+                if scan_started.elapsed() >= MAX_SCAN_DURATION {
+                    timed_out.store(true, Ordering::Relaxed);
+                    break;
+                }
                 if regions_walked >= MAX_REGIONS_WALKED {
                     break;
                 }
@@ -1406,8 +1641,12 @@ mod windows_impl {
                     let is_image = region_type == MEM_IMAGE;
                     if is_readable && !is_image {
                         let effective_size = region_size.min(ABS_REGION_CAP);
+                        intended_scan_bytes =
+                            intended_scan_bytes.saturating_add(region_size as u64);
                         if effective_size < region_size {
                             truncated_regions += 1;
+                            truncated_bytes = truncated_bytes
+                                .saturating_add((region_size - effective_size) as u64);
                         }
                         regions_to_scan.push((address, effective_size));
                     }
@@ -1431,7 +1670,7 @@ mod windows_impl {
         let bytes_scanned = Arc::new(AtomicU64::new(0));
         let regions_scanned = Arc::new(AtomicUsize::new(0));
         let read_failures = Arc::new(AtomicUsize::new(0));
-        let timed_out = Arc::new(AtomicBool::new(false));
+        let read_failed_bytes = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Watchdog + heartbeat: a single thread that both emits periodic
@@ -1443,16 +1682,16 @@ mod windows_impl {
         let hb_timeout = timed_out.clone();
         let hb_shutdown = shutdown.clone();
         let hb_reporter = reporter.clone();
-        let scan_started = std::time::Instant::now();
+        let hb_scan_started = scan_started;
         let hb_thread = std::thread::spawn(move || {
             let interval = std::time::Duration::from_millis(400);
             loop {
                 std::thread::park_timeout(interval);
-                if hb_shutdown.load(Ordering::Relaxed) {
+                if hb_scan_started.elapsed() >= MAX_SCAN_DURATION {
+                    hb_timeout.store(true, Ordering::Relaxed);
                     break;
                 }
-                if scan_started.elapsed() >= MAX_SCAN_DURATION {
-                    hb_timeout.store(true, Ordering::Relaxed);
+                if hb_shutdown.load(Ordering::Relaxed) {
                     break;
                 }
                 hb_reporter.heartbeat(
@@ -1494,6 +1733,7 @@ mod windows_impl {
                             &bytes_scanned,
                             &regions_scanned,
                             &read_failures,
+                            &read_failed_bytes,
                             &timed_out,
                         );
                     }
@@ -1506,6 +1746,10 @@ mod windows_impl {
                 a
             });
 
+        if scan_started.elapsed() >= MAX_SCAN_DURATION {
+            timed_out.store(true, Ordering::Relaxed);
+        }
+
         // Stop the heartbeat thread. `unpark` wakes it immediately so we
         // don't pay up to 400ms of sleep latency at the end of every scan.
         shutdown.store(true, Ordering::Relaxed);
@@ -1515,13 +1759,27 @@ mod windows_impl {
         let bytes_scanned_final = bytes_scanned.load(Ordering::Relaxed);
         let regions_scanned_final = regions_scanned.load(Ordering::Relaxed);
         let read_failures_final = read_failures.load(Ordering::Relaxed);
+        let read_failed_bytes_final = read_failed_bytes.load(Ordering::Relaxed);
         let timed_out_final = timed_out.load(Ordering::Relaxed);
         // Shadow the names the legacy reporting block below used, so the
         // diff between old and new is minimal.
         let bytes_scanned = bytes_scanned_final;
         let regions_scanned = regions_scanned_final;
         let read_failures = read_failures_final;
+        let read_failed_bytes = read_failed_bytes_final;
         let timed_out = timed_out_final;
+        let coverage = MemoryCoverage {
+            intended_bytes: intended_scan_bytes,
+            bytes_scanned,
+            regions_scanned,
+            truncated_regions,
+            truncated_bytes,
+            read_failures,
+            read_failed_bytes,
+        };
+        let coverage_details = coverage.details();
+        let no_successful_memory_reads = coverage.no_successful_reads();
+        let material_coverage_gap = coverage.material_gap();
 
         // Emit flag findings.
         findings.extend(findings_from_table(&table));
@@ -1538,18 +1796,59 @@ mod windows_impl {
                     MAX_SCAN_DURATION.as_secs()
                 ),
                 Some(format!(
-                    "PID: {}, regions_walked: {}, regions_scanned: {}, bytes_scanned: {}",
-                    pid, regions_walked, regions_scanned, bytes_scanned
+                    "PID: {}, regions_walked: {}, regions_scanned: {}, bytes_scanned: {} | {}",
+                    pid, regions_walked, regions_scanned, bytes_scanned, coverage_details
                 )),
             ));
-        } else if !scan_completed || regions_scanned == 0 {
+        } else if !scan_completed {
             findings.push(ScanFinding::new(
                 "memory_scanner",
                 ScanVerdict::Inconclusive,
                 "Memory scan incomplete: region enumeration terminated early — cannot attest clean state",
                 Some(format!(
-                    "PID: {}, regions_walked: {}, regions_scanned: {}, bytes: {}",
-                    pid, regions_walked, regions_scanned, bytes_scanned
+                    "PID: {}, regions_walked: {}, regions_scanned: {}, bytes_scanned: {} | {}",
+                    pid, regions_walked, regions_scanned, bytes_scanned, coverage_details
+                )),
+            ));
+        } else if no_successful_memory_reads {
+            findings.push(ScanFinding::new(
+                "memory_scanner",
+                ScanVerdict::Inconclusive,
+                "Memory scan incomplete: no readable Roblox memory bytes could be read",
+                Some(format!(
+                    "PID: {}, regions_walked: {}, regions_queued: {} | {}",
+                    pid,
+                    regions_walked,
+                    regions_to_scan.len(),
+                    coverage_details
+                )),
+            ));
+        } else if regions_scanned == 0 {
+            findings.push(ScanFinding::new(
+                "memory_scanner",
+                ScanVerdict::Inconclusive,
+                "Memory scan incomplete: no readable Roblox memory regions were scanned",
+                Some(format!(
+                    "PID: {}, regions_walked: {}, regions_queued: {} | {}",
+                    pid,
+                    regions_walked,
+                    regions_to_scan.len(),
+                    coverage_details
+                )),
+            ));
+        } else if material_coverage_gap {
+            findings.push(ScanFinding::new(
+                "memory_scanner",
+                ScanVerdict::Inconclusive,
+                "Material memory coverage gap — cannot fully attest Roblox process memory",
+                Some(format!(
+                    "PID: {}, intended_bytes: {}, bytes_scanned: {}, truncated_bytes: {}, read_failed_bytes: {}, {}",
+                    pid,
+                    coverage.intended_bytes,
+                    bytes_scanned,
+                    truncated_bytes,
+                    read_failed_bytes,
+                    coverage_details
                 )),
             ));
         } else if table.total_flags() == 0 {
@@ -1558,30 +1857,18 @@ mod windows_impl {
                 ScanVerdict::Clean,
                 "No suspicious FFlags found in Roblox process memory",
                 Some(format!(
-                    "PID: {}, regions_scanned: {}, bytes_scanned: {}",
-                    pid, regions_scanned, bytes_scanned
+                    "PID: {}, regions_scanned: {}, bytes_scanned: {} | {}",
+                    pid, regions_scanned, bytes_scanned, coverage_details
                 )),
             ));
-        }
-        if truncated_regions > 0 {
+        } else {
             findings.push(ScanFinding::new(
                 "memory_scanner",
-                ScanVerdict::Inconclusive,
-                "One or more memory regions exceeded scan cap and were only partially scanned",
+                ScanVerdict::Clean,
+                "Memory scan completed with acceptable coverage",
                 Some(format!(
-                    "PID: {}, truncated_regions: {}, per_region_cap_bytes: {}",
-                    pid, truncated_regions, ABS_REGION_CAP
-                )),
-            ));
-        }
-        if read_failures > 0 {
-            findings.push(ScanFinding::new(
-                "memory_scanner",
-                ScanVerdict::Inconclusive,
-                "Some readable memory chunks could not be read — memory scan coverage was incomplete",
-                Some(format!(
-                    "PID: {}, read_failures: {}, regions_scanned: {}, bytes_scanned: {}",
-                    pid, read_failures, regions_scanned, bytes_scanned
+                    "PID: {}, regions_scanned: {} | {}",
+                    pid, regions_scanned, coverage_details
                 )),
             ));
         }
@@ -1847,12 +2134,12 @@ mod windows_impl {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_pointer_width = "64"))]
 fn trusted_windows_roblox_roots() -> Vec<String> {
     windows_impl::trusted_windows_roblox_roots()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_pointer_width = "64"))]
 async fn scan_windows(reporter: ScanProgress) -> Vec<ScanFinding> {
     windows_impl::scan_windows(reporter).await
 }
@@ -1868,13 +2155,105 @@ mod tests {
         s.as_bytes().to_vec()
     }
 
+    #[test]
+    fn small_memory_coverage_gaps_are_not_material() {
+        let intended = 4 * 1024 * 1024 * 1024u64;
+        let missing = 256 * 1024 * 1024u64;
+        assert!(
+            !coverage_gap_is_material(missing, intended),
+            "normal transient unreadable chunks should stay in details"
+        );
+    }
+
+    #[test]
+    fn large_memory_coverage_gaps_are_material() {
+        let intended = 10 * 1024 * 1024 * 1024u64;
+        let missing = 1024 * 1024 * 1024u64;
+        assert!(
+            coverage_gap_is_material(missing, intended),
+            "large skipped/unreadable memory spans should remain visible"
+        );
+    }
+
+    #[test]
+    fn high_percent_but_tiny_memory_coverage_gaps_are_not_material() {
+        let intended = 1024 * 1024 * 1024u64;
+        let missing = 300 * 1024 * 1024u64;
+        assert!(
+            !coverage_gap_is_material(missing, intended),
+            "moderate churn should not become a top-level warning unless the byte gap is also large"
+        );
+    }
+
+    #[test]
+    fn near_total_memory_coverage_loss_is_material_even_below_one_gib() {
+        let intended = 512 * 1024 * 1024u64;
+        let missing = 511 * 1024 * 1024u64;
+        assert!(
+            coverage_gap_is_material(missing, intended),
+            "a nearly unreadable small scan must not report clean"
+        );
+    }
+
+    #[test]
+    fn memory_coverage_details_keep_non_material_gap_context() {
+        let coverage = MemoryCoverage {
+            intended_bytes: 4 * 1024 * 1024 * 1024u64,
+            bytes_scanned: 3 * 1024 * 1024 * 1024u64,
+            regions_scanned: 12,
+            truncated_regions: 1,
+            truncated_bytes: 128 * 1024 * 1024u64,
+            read_failures: 2,
+            read_failed_bytes: 64 * 1024 * 1024u64,
+        };
+
+        assert!(!coverage.material_gap());
+        let details = coverage.details();
+        assert!(details.contains("coverage_gap_bytes: 201326592"));
+        assert!(details.contains("coverage_gap_percent: 4%"));
+        assert!(details.contains("truncated_regions: 1"));
+        assert!(details.contains("read_failures: 2"));
+    }
+
+    #[test]
+    fn zero_successful_memory_reads_are_never_clean_coverage() {
+        let coverage = MemoryCoverage {
+            intended_bytes: 512 * 1024 * 1024u64,
+            bytes_scanned: 0,
+            regions_scanned: 0,
+            truncated_regions: 0,
+            truncated_bytes: 0,
+            read_failures: 128,
+            read_failed_bytes: 512 * 1024 * 1024u64,
+        };
+
+        assert!(coverage.no_successful_reads());
+        assert!(coverage.material_gap());
+    }
+
+    #[test]
+    fn memory_coverage_gap_combines_truncation_and_read_failures() {
+        let coverage = MemoryCoverage {
+            intended_bytes: 8 * 1024 * 1024 * 1024u64,
+            bytes_scanned: 6 * 1024 * 1024 * 1024u64,
+            regions_scanned: 42,
+            truncated_regions: 1,
+            truncated_bytes: 700 * 1024 * 1024u64,
+            read_failures: 3,
+            read_failed_bytes: 400 * 1024 * 1024u64,
+        };
+
+        assert_eq!(coverage.gap_bytes(), 1_153_433_600);
+        assert!(coverage.material_gap());
+    }
+
     /// Regression guard: Bloxstrap / Fishstrap install Roblox under their
     /// own `Versions\` subdirectories. Those launchers are explicitly
     /// treated as legitimate elsewhere in the scanner, so the memory-scan
     /// trust check must accept their RobloxPlayerBeta.exe paths — otherwise
     /// a Bloxstrap-launched Roblox gets "untrusted path, refusing to scan"
     /// and the memory scanner is effectively disabled for most real users.
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
     #[test]
     fn trust_roots_include_bloxstrap_and_fishstrap() {
         let old_local_app_data = std::env::var_os("LocalAppData");
