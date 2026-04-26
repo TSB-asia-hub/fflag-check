@@ -1636,6 +1636,10 @@ mod windows_impl {
         Some(0x4C),
         Some(0x8D),
         Some(0x05),
+        None,
+        None,
+        None,
+        None,
     ];
 
     fn read_process_exact(handle: HANDLE, addr: usize, out: &mut [u8]) -> bool {
@@ -1745,7 +1749,7 @@ mod windows_impl {
                 for slot in find_runtime_singleton_slots(&scratch[..size], addr) {
                     if let Some(singleton) = read_process_u64(handle, slot)
                         .and_then(|p| usize::try_from(p).ok())
-                        .filter(|&p| p != 0)
+                        .filter(|&p| p != 0 && runtime_table_header_looks_valid(handle, p))
                     {
                         if !candidates
                             .iter()
@@ -1764,6 +1768,18 @@ mod windows_impl {
         }
 
         candidates
+    }
+
+    fn runtime_table_header_looks_valid(handle: HANDLE, singleton: usize) -> bool {
+        let mut table = [0u8; RUNTIME_TABLE_SIZE];
+        if !read_process_exact(handle, singleton.saturating_add(0x8), &mut table) {
+            return false;
+        }
+
+        let sentinel = u64::from_le_bytes(table[0x00..0x08].try_into().unwrap());
+        let buckets = u64::from_le_bytes(table[0x10..0x18].try_into().unwrap());
+        let mask = u64::from_le_bytes(table[0x28..0x30].try_into().unwrap());
+        sentinel != 0 && buckets != 0 && mask != 0 && mask <= 0x00ff_ffff
     }
 
     fn remote_node_string_matches(
@@ -1855,7 +1871,7 @@ mod windows_impl {
 
         let mut findings = Vec::new();
         let mut inspected = 0usize;
-        for candidate in candidates.iter().take(4) {
+        for candidate in &candidates {
             for &rule in RUNTIME_OVERRIDE_RULES {
                 let entry = match lookup_runtime_flag_entry(handle, candidate.singleton, rule.name)
                 {
